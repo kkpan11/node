@@ -7,12 +7,14 @@ const { test } = require('node:test');
 
 const fixture1 = fixtures.path('test-runner', 'no-isolation', 'one.test.js');
 const fixture2 = fixtures.path('test-runner', 'no-isolation', 'two.test.js');
+const asyncBuildFilteredSuite =
+  fixtures.path('test-runner', 'filtered-suite-async-build.mjs');
 
 test('works with --test-only', () => {
   const args = [
     '--test',
     '--test-reporter=tap',
-    '--experimental-test-isolation=none',
+    '--test-isolation=none',
     '--test-only',
     fixture1,
     fixture2,
@@ -35,7 +37,7 @@ test('works without --test-only', () => {
   const args = [
     '--test',
     '--test-reporter=tap',
-    '--experimental-test-isolation=none',
+    '--test-isolation=none',
     fixture1,
     fixture2,
   ];
@@ -57,7 +59,7 @@ test('works with --test-name-pattern', () => {
   const args = [
     '--test',
     '--test-reporter=tap',
-    '--experimental-test-isolation=none',
+    '--test-isolation=none',
     '--test-name-pattern=/test one/',
     fixture1,
     fixture2,
@@ -71,11 +73,32 @@ test('works with --test-name-pattern', () => {
   assert.match(stdout, /# suites 0/);
 });
 
+test('filtered suites with an async build do not leave cancelled tests', () => {
+  const args = [
+    '--test',
+    '--test-reporter=tap',
+    '--test-isolation=none',
+    '--test-name-pattern=C',
+    asyncBuildFilteredSuite,
+  ];
+  const child = spawnSync(process.execPath, args);
+  const stdout = child.stdout.toString();
+
+  assert.strictEqual(child.status, 0);
+  assert.strictEqual(child.signal, null);
+  assert.match(stdout, /# tests 1/);
+  assert.match(stdout, /# suites 2/);
+  assert.match(stdout, /# pass 1/);
+  assert.match(stdout, /# fail 0/);
+  assert.match(stdout, /# cancelled 0/);
+  assert.doesNotMatch(stdout, /parentAlreadyFinished/);
+});
+
 test('works with --test-skip-pattern', () => {
   const args = [
     '--test',
     '--test-reporter=tap',
-    '--experimental-test-isolation=none',
+    '--test-isolation=none',
     '--test-skip-pattern=/one/',
     fixture1,
     fixture2,

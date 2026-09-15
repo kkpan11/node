@@ -11,18 +11,8 @@ const { exec, spawn } = require('child_process');
 const { once } = require('events');
 let stdOut;
 
-// The execPath might contain chars that should be escaped in a shell context.
-// On non-Windows, we can pass the path via the env; `"` is not a valid char on
-// Windows, so we can simply pass the path.
-const execNode = (args, callback) => exec(
-  `"${common.isWindows ? process.execPath : '$NODE'}" ${args}`,
-  common.isWindows ? undefined : { env: { ...process.env, NODE: process.execPath } },
-  callback,
-);
-
-
 function startPrintHelpTest() {
-  execNode('--help', common.mustSucceed((stdout, stderr) => {
+  exec(...common.escapePOSIXShell`"${process.execPath}" --help`, common.mustSucceed((stdout, stderr) => {
     stdOut = stdout;
     validateNodePrintHelp();
   }));
@@ -36,8 +26,9 @@ function validateNodePrintHelp() {
   const cliHelpOptions = [
     { compileConstant: HAVE_OPENSSL,
       flags: [ '--openssl-config=...', '--tls-cipher-list=...',
-               '--use-bundled-ca', '--use-openssl-ca',
-               '--enable-fips', '--force-fips' ] },
+               '--use-bundled-ca', '--use-openssl-ca', '--use-system-ca',
+               '--enable-fips', '--enable-fips-indicator-events',
+               '--force-fips' ] },
     { compileConstant: NODE_HAVE_I18N_SUPPORT,
       flags: [ '--icu-data-dir=...', 'NODE_ICU_DATA' ] },
     { compileConstant: HAVE_INSPECTOR,
@@ -50,15 +41,15 @@ function validateNodePrintHelp() {
 
 function testForSubstring(options) {
   if (options.compileConstant) {
-    options.flags.forEach((flag) => {
-      assert.strictEqual(stdOut.indexOf(flag) !== -1, true,
-                         `Missing flag ${flag} in ${stdOut}`);
-    });
+    for (const flag of options.flags) {
+      assert.notStrictEqual(stdOut.indexOf(flag), -1,
+                            `Missing flag ${flag} in ${stdOut}`);
+    }
   } else {
-    options.flags.forEach((flag) => {
+    for (const flag of options.flags) {
       assert.strictEqual(stdOut.indexOf(flag), -1,
                          `Unexpected flag ${flag} in ${stdOut}`);
-    });
+    }
   }
 }
 

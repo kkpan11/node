@@ -2,8 +2,7 @@
 
 require('../common');
 const { spawnSyncAndAssert } = require('../common/child_process');
-const { fixturesDir } = require('../common/fixtures');
-const stderr = /ExperimentalWarning: Support for loading ES Module in require/;
+const fixtures = require('../common/fixtures');
 
 function testPreload(preloadFlag) {
   // Test named exports.
@@ -17,11 +16,10 @@ function testPreload(preloadFlag) {
         './printA.js',
       ],
       {
-        cwd: fixturesDir
+        cwd: fixtures.fixturesDir,
       },
       {
         stdout: 'A',
-        stderr,
         trim: true,
       }
     );
@@ -38,10 +36,9 @@ function testPreload(preloadFlag) {
         './printA.js',
       ],
       {
-        cwd: fixturesDir
+        cwd: fixtures.fixturesDir,
       },
       {
-        stderr,
         stdout: /^world\s+A$/,
         trim: true,
       }
@@ -59,11 +56,10 @@ function testPreload(preloadFlag) {
         './printA.js',
       ],
       {
-        cwd: fixturesDir
+        cwd: fixtures.fixturesDir,
       },
       {
         stdout: /^ok\s+A$/,
-        stderr,
         trim: true,
       }
     );
@@ -82,11 +78,10 @@ function testPreload(preloadFlag) {
         './printA.js',
       ],
       {
-        cwd: fixturesDir
+        cwd: fixtures.fixturesDir,
       },
       {
         stdout: /^world\s+A$/,
-        stderr,
         trim: true,
       }
     );
@@ -108,11 +103,10 @@ testPreload('--import');
       './printA.js',
     ],
     {
-      cwd: fixturesDir
+      cwd: fixtures.fixturesDir,
     },
     {
       stdout: /^package-type-module\s+A$/,
-      stderr,
       trim: true,
     }
   );

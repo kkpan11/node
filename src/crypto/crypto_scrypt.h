@@ -25,7 +25,6 @@ namespace crypto {
 // at least 16 bytes in length.
 
 struct ScryptConfig final : public MemoryRetainer {
-  CryptoJobMode mode;
   ByteSource pass;
   ByteSource salt;
   uint32_t N;
@@ -57,10 +56,11 @@ struct ScryptTraits final {
       unsigned int offset,
       ScryptConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const ScryptConfig& params,
-      ByteSource* out);
+  static bool DeriveBits(Environment* env,
+                         const ScryptConfig& params,
+                         ByteSource* out,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const ScryptConfig& params,

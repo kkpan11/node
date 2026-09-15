@@ -61,10 +61,26 @@ changes:
 An [`Agent`][] object for HTTPS similar to [`http.Agent`][]. See
 [`https.request()`][] for more information.
 
+Like `http.Agent`, the `createConnection(options[, callback])` method can be overridden
+to customize how TLS connections are established.
+
+> See [`agent.createConnection()`][] for details on overriding this method,
+> including asynchronous socket creation with a callback.
+
 ### `new Agent([options])`
 
 <!-- YAML
 changes:
+  - version:
+    - v24.5.0
+    - v22.21.0
+    pr-url: https://github.com/nodejs/node/pull/58980
+    description: Add support for `proxyEnv`.
+  - version:
+    - v24.5.0
+    - v22.21.0
+    pr-url: https://github.com/nodejs/node/pull/58980
+    description: Add support for `defaultPort` and `protocol`.
   - version: v12.5.0
     pr-url: https://github.com/nodejs/node/pull/28209
     description: do not automatically set servername if the target host was
@@ -83,6 +99,10 @@ changes:
     extension).
 
     See [`Session Resumption`][] for information about TLS session reuse.
+
+Requests that specify a custom `checkServerIdentity` option are not eligible
+for connection reuse or TLS session reuse by an `https.Agent`, unless the
+`checkServerIdentity` option was specified when constructing the Agent.
 
 #### Event: `'keylog'`
 
@@ -137,9 +157,11 @@ See [`server.close()`][] in the `node:http` module.
 
 <!-- YAML
 added: v20.4.0
+changes:
+ - version: v24.2.0
+   pr-url: https://github.com/nodejs/node/pull/58467
+   description: No longer experimental.
 -->
-
-> Stability: 1 - Experimental
 
 Calls [`server.close()`][httpsServerClose] and returns a promise that
 fulfills when the server has closed.
@@ -166,7 +188,7 @@ See [`server.closeIdleConnections()`][] in the `node:http` module.
 added: v11.3.0
 -->
 
-* {number} **Default:** `60000`
+* Type: {number} **Default:** `60000`
 
 See [`server.headersTimeout`][] in the `node:http` module.
 
@@ -177,7 +199,7 @@ This method is identical to [`server.listen()`][] from [`net.Server`][].
 
 ### `server.maxHeadersCount`
 
-* {number} **Default:** `2000`
+* Type: {number} **Default:** `1000`
 
 See [`server.maxHeadersCount`][] in the `node:http` module.
 
@@ -192,7 +214,7 @@ changes:
                  from no timeout to 300s (5 minutes).
 -->
 
-* {number} **Default:** `300000`
+* Type: {number} **Default:** `300000`
 
 See [`server.requestTimeout`][] in the `node:http` module.
 
@@ -218,7 +240,7 @@ changes:
     description: The default timeout changed from 120s to 0 (no timeout).
 -->
 
-* {number} **Default:** 0 (no timeout)
+* Type: {number} **Default:** 0 (no timeout)
 
 See [`server.timeout`][] in the `node:http` module.
 
@@ -228,7 +250,7 @@ See [`server.timeout`][] in the `node:http` module.
 added: v8.0.0
 -->
 
-* {number} **Default:** `5000` (5 seconds)
+* Type: {number} **Default:** `5000` (5 seconds)
 
 See [`server.keepAliveTimeout`][] in the `node:http` module.
 
@@ -341,6 +363,7 @@ changes:
 * `options` {Object | string | URL} Accepts the same `options` as
   [`https.request()`][], with the method set to GET by default.
 * `callback` {Function}
+* Returns: {http.ClientRequest}
 
 Like [`http.get()`][] but for HTTPS.
 
@@ -404,6 +427,9 @@ a `timeout` of 5 seconds.
 <!-- YAML
 added: v0.3.6
 changes:
+  - version: REPLACEME
+    pr-url: https://github.com/nodejs/node/pull/63966
+    description: The `clientCertEngine` option is runtime deprecated.
   - version:
     - v22.4.0
     - v20.16.0
@@ -725,6 +751,7 @@ statusCode: 200
 [`Agent`]: #class-httpsagent
 [`Session Resumption`]: tls.md#session-resumption
 [`URL`]: url.md#the-whatwg-url-api
+[`agent.createConnection()`]: http.md#agentcreateconnectionoptions-callback
 [`http.Agent(options)`]: http.md#new-agentoptions
 [`http.Agent`]: http.md#class-httpagent
 [`http.ClientRequest`]: http.md#class-httpclientrequest

@@ -19,22 +19,24 @@ class DiffieHellman final : public BaseObject {
   static void Initialize(Environment* env, v8::Local<v8::Object> target);
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
 
-  DiffieHellman(Environment* env, v8::Local<v8::Object> wrap, DHPointer dh);
-  operator DHPointer&() { return dh_; }
+  DiffieHellman(Environment* env,
+                v8::Local<v8::Object> wrap,
+                ncrypto::DHPointer dh);
+  operator ncrypto::DHPointer&() { return dh_; }
 
   void MemoryInfo(MemoryTracker* tracker) const override;
   SET_MEMORY_INFO_NAME(DiffieHellman)
   SET_SELF_SIZE(DiffieHellman)
 
  private:
-  DHPointer dh_;
+  ncrypto::DHPointer dh_;
 };
 
 struct DhKeyPairParams final : public MemoryRetainer {
   // Diffie-Hellman can either generate keys using a fixed prime, or by first
   // generating a random prime of a given size (in bits). Only one of both
   // options may be specified.
-  std::variant<BignumPointer, int> prime;
+  std::variant<ncrypto::BignumPointer, int> prime;
   unsigned int generator;
   SET_NO_MEMORY_INFO()
   SET_MEMORY_INFO_NAME(DhKeyPairParams)
@@ -47,7 +49,7 @@ struct DhKeyGenTraits final {
   using AdditionalParameters = DhKeyPairGenConfig;
   static constexpr const char* JobName = "DhKeyPairGenJob";
 
-  static EVPKeyCtxPointer Setup(DhKeyPairGenConfig* params);
+  static ncrypto::EVPKeyCtxPointer Setup(DhKeyPairGenConfig* params);
 
   static v8::Maybe<void> AdditionalConfig(
       CryptoJobMode mode,
@@ -57,29 +59,6 @@ struct DhKeyGenTraits final {
 };
 
 using DHKeyPairGenJob = KeyGenJob<KeyPairGenTraits<DhKeyGenTraits>>;
-
-struct DHKeyExportConfig final : public MemoryRetainer {
-  SET_NO_MEMORY_INFO()
-  SET_MEMORY_INFO_NAME(DHKeyExportConfig)
-  SET_SELF_SIZE(DHKeyExportConfig)
-};
-
-struct DHKeyExportTraits final {
-  static constexpr const char* JobName = "DHKeyExportJob";
-  using AdditionalParameters = DHKeyExportConfig;
-
-  static v8::Maybe<void> AdditionalConfig(
-      const v8::FunctionCallbackInfo<v8::Value>& args,
-      unsigned int offset,
-      DHKeyExportConfig* config);
-
-  static WebCryptoKeyExportStatus DoExport(const KeyObjectData& key_data,
-                                           WebCryptoKeyFormat format,
-                                           const DHKeyExportConfig& params,
-                                           ByteSource* out);
-};
-
-using DHKeyExportJob = KeyExportJob<DHKeyExportTraits>;
 
 struct DHBitsConfig final : public MemoryRetainer {
   KeyObjectData private_key;
@@ -101,10 +80,11 @@ struct DHBitsTraits final {
       unsigned int offset,
       DHBitsConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const DHBitsConfig& params,
-      ByteSource* out_);
+  static bool DeriveBits(Environment* env,
+                         const DHBitsConfig& params,
+                         ByteSource* out_,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const DHBitsConfig& params,
@@ -113,9 +93,9 @@ struct DHBitsTraits final {
 
 using DHBitsJob = DeriveBitsJob<DHBitsTraits>;
 
-v8::Maybe<void> GetDhKeyDetail(Environment* env,
-                               const KeyObjectData& key,
-                               v8::Local<v8::Object> target);
+bool GetDhKeyDetail(Environment* env,
+                    const KeyObjectData& key,
+                    v8::Local<v8::Object> target);
 
 }  // namespace crypto
 }  // namespace node

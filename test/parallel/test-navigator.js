@@ -36,10 +36,10 @@ const { getNavigatorPlatform } = require('internal/navigator');
 const { execFile } = require('child_process');
 
 const is = {
-  number: (value, key) => {
+  number: common.mustCallAtLeast((value, key) => {
     assert(!Number.isNaN(value), `${key} should not be NaN`);
     assert.strictEqual(typeof value, 'number');
-  },
+  }),
 };
 
 is.number(+navigator.hardwareConcurrency, 'hardwareConcurrency');
@@ -100,7 +100,7 @@ assert.strictEqual(getNavigatorPlatform('x64', 'openbsd'), 'OpenBSD amd64');
 assert.strictEqual(getNavigatorPlatform('arm64', 'openbsd'), 'OpenBSD arm64');
 assert.strictEqual(getNavigatorPlatform('ia32', 'sunos'), 'SunOS i86pc');
 assert.strictEqual(getNavigatorPlatform('x64', 'sunos'), 'SunOS x64');
-assert.strictEqual(getNavigatorPlatform('ppc', 'aix'), 'AIX');
+assert.strictEqual(getNavigatorPlatform('ppc64', 'aix'), 'AIX');
 assert.strictEqual(getNavigatorPlatform('x64', 'reactos'), 'Reactos x64');
 
 assert.strictEqual(typeof navigator.language, 'string');
@@ -147,3 +147,19 @@ Object.defineProperty(navigator, 'language', { value: 'for-testing' });
 assert.strictEqual(navigator.language, 'for-testing');
 assert.strictEqual(navigator.languages.length, 1);
 assert.strictEqual(navigator.languages[0] !== 'for-testing', true);
+
+{
+  const { Navigator } = globalThis;
+  for (const name of Object.keys(Navigator.prototype)) {
+    assert.throws(
+      () => Navigator.prototype[name],
+      { name: 'TypeError' },
+      `expected TypeError when reading ${name} on Navigator.prototype`,
+    );
+    assert.throws(
+      () => Reflect.get(Navigator.prototype, name, {}),
+      { name: 'TypeError' },
+      `expected TypeError when reading ${name} on a plain object`,
+    );
+  }
+}

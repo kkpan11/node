@@ -10,6 +10,10 @@
 #include "memory_tracker.h"
 #include "v8.h"
 
+#ifdef NODE_OPENSSL_HAS_CERT_COMP
+#include <vector>
+#endif
+
 namespace node {
 namespace crypto {
 // A maxVersion of 0 means "any", but OpenSSL may support TLS versions that
@@ -19,11 +23,11 @@ constexpr int kMaxSupportedVersion = TLS1_3_VERSION;
 void GetRootCertificates(
     const v8::FunctionCallbackInfo<v8::Value>& args);
 
-X509_STORE* NewRootCertStore();
+X509_STORE* NewRootCertStore(Environment* env);
 
-X509_STORE* GetOrCreateRootCertStore();
+X509_STORE* GetOrCreateRootCertStore(Environment* env);
 
-BIOPointer LoadBIO(Environment* env, v8::Local<v8::Value> v);
+ncrypto::BIOPointer LoadBIO(Environment* env, v8::Local<v8::Value> v);
 
 class SecureContext final : public BaseObject {
  public:
@@ -41,34 +45,54 @@ class SecureContext final : public BaseObject {
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
   static SecureContext* Create(Environment* env);
 
-  const SSLCtxPointer& ctx() const { return ctx_; }
+  const ncrypto::SSLCtxPointer& ctx() const { return ctx_; }
 
   // Non-const ctx() that allows for non-default initialization of
   // the SecureContext.
-  SSLCtxPointer& ctx() { return ctx_; }
+  ncrypto::SSLCtxPointer& ctx() { return ctx_; }
 
-  SSLPointer CreateSSL();
+#ifdef NODE_OPENSSL_HAS_CERT_COMP
+  bool HasCertCompression() const {
+    return cert_comp_prefs_len_ > 0;
+  }
+  int* CertCompPrefs() {
+    return cert_comp_prefs_;
+  }
+  size_t CertCompPrefsLen() const {
+    return cert_comp_prefs_len_;
+  }
+
+  struct CompressedCertData {
+    int algorithm;
+    std::vector<unsigned char> data;
+    size_t orig_length;
+  };
+  const std::vector<CompressedCertData>& CompressedCerts() const {
+    return compressed_certs_;
+  }
+#endif
+
+  ncrypto::SSLPointer CreateSSL();
 
   void SetGetSessionCallback(GetSessionCb cb);
   void SetKeylogCallback(KeylogCb cb);
   void SetNewSessionCallback(NewSessionCb cb);
   void SetSelectSNIContextCallback(SelectSNIContextCb cb);
 
-  inline const X509Pointer& issuer() const { return issuer_; }
-  inline const X509Pointer& cert() const { return cert_; }
+  inline const ncrypto::X509Pointer& issuer() const { return issuer_; }
+  inline const ncrypto::X509Pointer& cert() const { return cert_; }
 
-  v8::Maybe<void> AddCert(Environment* env, BIOPointer&& bio);
-  v8::Maybe<void> SetCRL(Environment* env, const BIOPointer& bio);
+  v8::Maybe<void> AddCert(Environment* env, ncrypto::BIOPointer&& bio);
+  v8::Maybe<void> SetCRL(Environment* env, const ncrypto::BIOPointer& bio);
   v8::Maybe<void> UseKey(Environment* env, const KeyObjectData& key);
 
-  void SetCACert(const BIOPointer& bio);
+  void SetCACert(const ncrypto::BIOPointer& bio);
   void SetRootCerts();
 
   void SetX509StoreFlag(unsigned long flags);  // NOLINT(runtime/int)
   X509_STORE* GetCertStoreOwnedByThisSecureContext();
 
-  // TODO(joyeecheung): track the memory used by OpenSSL types
-  SET_NO_MEMORY_INFO()
+  void MemoryInfo(MemoryTracker* tracker) const override;
   SET_MEMORY_INFO_NAME(SecureContext)
   SET_SELF_SIZE(SecureContext)
 
@@ -107,6 +131,10 @@ class SecureContext final : public BaseObject {
       const v8::FunctionCallbackInfo<v8::Value>& args);
   static void SetSessionTimeout(
       const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetCertificateCompression(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void GetCertificateCompressionAlgorithms(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
   static void SetMinProto(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void SetMaxProto(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void GetMinProto(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -130,23 +158,31 @@ class SecureContext final : public BaseObject {
                                unsigned char* name,
                                unsigned char* iv,
                                EVP_CIPHER_CTX* ectx,
+#if NCRYPTO_USE_OPENSSL3_PROVIDER
+                               EVP_MAC_CTX* hctx,
+#else
                                HMAC_CTX* hctx,
+#endif
                                int enc);
 
   static int TicketCompatibilityCallback(SSL* ssl,
                                          unsigned char* name,
                                          unsigned char* iv,
                                          EVP_CIPHER_CTX* ectx,
+#if NCRYPTO_USE_OPENSSL3_PROVIDER
+                                         EVP_MAC_CTX* hctx,
+#else
                                          HMAC_CTX* hctx,
+#endif
                                          int enc);
 
   SecureContext(Environment* env, v8::Local<v8::Object> wrap);
   void Reset();
 
  private:
-  SSLCtxPointer ctx_;
-  X509Pointer cert_;
-  X509Pointer issuer_;
+  ncrypto::SSLCtxPointer ctx_;
+  ncrypto::X509Pointer cert_;
+  ncrypto::X509Pointer issuer_;
   // Non-owning cache for SSL_CTX_get_cert_store(ctx_.get())
   X509_STORE* own_cert_store_cache_ = nullptr;
 #ifndef OPENSSL_NO_ENGINE
@@ -157,12 +193,13 @@ class SecureContext final : public BaseObject {
   unsigned char ticket_key_name_[16];
   unsigned char ticket_key_aes_[16];
   unsigned char ticket_key_hmac_[16];
-};
 
-int SSL_CTX_use_certificate_chain(SSL_CTX* ctx,
-                                  BIOPointer&& in,
-                                  X509Pointer* cert,
-                                  X509Pointer* issuer);
+#ifdef NODE_OPENSSL_HAS_CERT_COMP
+  int cert_comp_prefs_[TLSEXT_comp_cert_limit] = {};
+  size_t cert_comp_prefs_len_ = 0;
+  std::vector<CompressedCertData> compressed_certs_;
+#endif
+};
 
 }  // namespace crypto
 }  // namespace node

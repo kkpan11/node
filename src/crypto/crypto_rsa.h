@@ -26,8 +26,8 @@ struct RsaKeyPairParams final : public MemoryRetainer {
 
   // The following options are used for RSA-PSS. If any of them are set, a
   // RSASSA-PSS-params sequence will be added to the key.
-  const EVP_MD* md = nullptr;
-  const EVP_MD* mgf1_md = nullptr;
+  ncrypto::Digest md = nullptr;
+  ncrypto::Digest mgf1_md = nullptr;
   int saltlen = -1;
 
   SET_NO_MEMORY_INFO()
@@ -41,7 +41,7 @@ struct RsaKeyGenTraits final {
   using AdditionalParameters = RsaKeyPairGenConfig;
   static constexpr const char* JobName = "RsaKeyPairGenJob";
 
-  static EVPKeyCtxPointer Setup(RsaKeyPairGenConfig* params);
+  static ncrypto::EVPKeyCtxPointer Setup(RsaKeyPairGenConfig* params);
 
   static v8::Maybe<void> AdditionalConfig(
       CryptoJobMode mode,
@@ -52,35 +52,10 @@ struct RsaKeyGenTraits final {
 
 using RSAKeyPairGenJob = KeyGenJob<KeyPairGenTraits<RsaKeyGenTraits>>;
 
-struct RSAKeyExportConfig final : public MemoryRetainer {
-  RSAKeyVariant variant = kKeyVariantRSA_SSA_PKCS1_v1_5;
-  SET_NO_MEMORY_INFO()
-  SET_MEMORY_INFO_NAME(RSAKeyExportConfig)
-  SET_SELF_SIZE(RSAKeyExportConfig)
-};
-
-struct RSAKeyExportTraits final {
-  static constexpr const char* JobName = "RSAKeyExportJob";
-  using AdditionalParameters = RSAKeyExportConfig;
-
-  static v8::Maybe<void> AdditionalConfig(
-      const v8::FunctionCallbackInfo<v8::Value>& args,
-      unsigned int offset,
-      RSAKeyExportConfig* config);
-
-  static WebCryptoKeyExportStatus DoExport(const KeyObjectData& key_data,
-                                           WebCryptoKeyFormat format,
-                                           const RSAKeyExportConfig& params,
-                                           ByteSource* out);
-};
-
-using RSAKeyExportJob = KeyExportJob<RSAKeyExportTraits>;
-
 struct RSACipherConfig final : public MemoryRetainer {
-  CryptoJobMode mode;
   ByteSource label;
   int padding = 0;
-  const EVP_MD* digest = nullptr;
+  ncrypto::Digest digest;
 
   RSACipherConfig() = default;
 
@@ -112,18 +87,15 @@ struct RSACipherTraits final {
 
 using RSACipherJob = CipherJob<RSACipherTraits>;
 
-v8::Maybe<void> ExportJWKRsaKey(Environment* env,
-                                const KeyObjectData& key,
-                                v8::Local<v8::Object> target);
+bool ExportJWKRsaKey(Environment* env,
+                     const KeyObjectData& key,
+                     v8::Local<v8::Object> target);
 
-KeyObjectData ImportJWKRsaKey(Environment* env,
-                              v8::Local<v8::Object> jwk,
-                              const v8::FunctionCallbackInfo<v8::Value>& args,
-                              unsigned int offset);
+KeyObjectData ImportJWKRsaKey(Environment* env, v8::Local<v8::Object> jwk);
 
-v8::Maybe<void> GetRsaKeyDetail(Environment* env,
-                                const KeyObjectData& key,
-                                v8::Local<v8::Object> target);
+bool GetRsaKeyDetail(Environment* env,
+                     const KeyObjectData& key,
+                     v8::Local<v8::Object> target);
 
 namespace RSAAlg {
 void Initialize(Environment* env, v8::Local<v8::Object> target);

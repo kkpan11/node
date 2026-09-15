@@ -53,10 +53,12 @@ MaybeLocal<Object> PipeWrap::Instantiate(Environment* env,
   EscapableHandleScope handle_scope(env->isolate());
   AsyncHooks::DefaultTriggerAsyncIdScope trigger_scope(parent);
   CHECK_EQ(false, env->pipe_constructor_template().IsEmpty());
-  Local<Function> constructor = env->pipe_constructor_template()
-                                    ->GetFunction(env->context())
-                                    .ToLocalChecked();
-  CHECK_EQ(false, constructor.IsEmpty());
+  Local<Function> constructor;
+  if (!env->pipe_constructor_template()
+           ->GetFunction(env->context())
+           .ToLocal(&constructor)) {
+    return {};
+  }
   Local<Value> type_value = Int32::New(env->isolate(), type);
   return handle_scope.EscapeMaybe(
       constructor->NewInstance(env->context(), 1, &type_value));
@@ -69,28 +71,31 @@ void PipeWrap::Initialize(Local<Object> target,
   Environment* env = Environment::GetCurrent(context);
   Isolate* isolate = env->isolate();
 
-  Local<FunctionTemplate> t = NewFunctionTemplate(isolate, New);
-  t->InstanceTemplate()->SetInternalFieldCount(StreamBase::kInternalFieldCount);
+  Local<FunctionTemplate> t = env->pipe_constructor_template();
+  if (t.IsEmpty()) {
+    t = NewFunctionTemplate(isolate, New);
+    t->InstanceTemplate()->SetInternalFieldCount(PipeWrap::kInternalFieldCount);
 
-  t->Inherit(LibuvStreamWrap::GetConstructorTemplate(env));
+    t->Inherit(LibuvStreamWrap::GetConstructorTemplate(env));
 
-  SetProtoMethod(isolate, t, "bind", Bind);
-  SetProtoMethod(isolate, t, "listen", Listen);
-  SetProtoMethod(isolate, t, "connect", Connect);
-  SetProtoMethod(isolate, t, "open", Open);
+    SetProtoMethod(isolate, t, "bind", Bind);
+    SetProtoMethod(isolate, t, "listen", Listen);
+    SetProtoMethod(isolate, t, "connect", Connect);
+    SetProtoMethod(isolate, t, "open", Open);
 
 #ifdef _WIN32
-  SetProtoMethod(isolate, t, "setPendingInstances", SetPendingInstances);
+    SetProtoMethod(isolate, t, "setPendingInstances", SetPendingInstances);
 #endif
 
-  SetProtoMethod(isolate, t, "fchmod", Fchmod);
-
-  SetConstructorFunction(context, target, "Pipe", t);
-  env->set_pipe_constructor_template(t);
+    SetProtoMethod(isolate, t, "fchmod", Fchmod);
+    t->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "Pipe"));
+    env->set_pipe_constructor_template(t);
+  }
+  SetConstructorFunction(
+      context, target, "Pipe", t, SetConstructorFunctionFlag::NONE);
 
   // Create FunctionTemplate for PipeConnectWrap.
-  auto cwt = BaseObject::MakeLazilyInitializedJSTemplate(env);
-  cwt->Inherit(AsyncWrap::GetConstructorTemplate(env));
+  auto cwt = AsyncWrap::MakeLazilyInitializedJSTemplate(env);
   SetConstructorFunction(context, target, "PipeConnectWrap", cwt);
 
   // Define constants
@@ -161,7 +166,10 @@ PipeWrap::PipeWrap(Environment* env,
 void PipeWrap::Bind(const FunctionCallbackInfo<Value>& args) {
   PipeWrap* wrap;
   ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
-  node::Utf8Value name(args.GetIsolate(), args[0]);
+  Environment* env = wrap->env();
+  node::Utf8Value name(env->isolate(), args[0]);
+  THROW_IF_INSUFFICIENT_PERMISSIONS(
+      env, permission::PermissionScope::kNet, name.ToStringView());
   int err =
       uv_pipe_bind2(&wrap->handle_, *name, name.length(), UV_PIPE_NO_TRUNCATE);
   args.GetReturnValue().Set(err);
@@ -180,8 +188,10 @@ void PipeWrap::SetPendingInstances(const FunctionCallbackInfo<Value>& args) {
 void PipeWrap::Fchmod(const v8::FunctionCallbackInfo<v8::Value>& args) {
   PipeWrap* wrap;
   ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
+  Environment* env = wrap->env();
   CHECK(args[0]->IsInt32());
   int mode = args[0].As<Int32>()->Value();
+  THROW_IF_INSUFFICIENT_PERMISSIONS(env, permission::PermissionScope::kNet, "");
   int err = uv_pipe_chmod(&wrap->handle_, mode);
   args.GetReturnValue().Set(err);
 }
@@ -192,6 +202,7 @@ void PipeWrap::Listen(const FunctionCallbackInfo<Value>& args) {
   Environment* env = wrap->env();
   int backlog;
   if (!args[0]->Int32Value(env->context()).To(&backlog)) return;
+  THROW_IF_INSUFFICIENT_PERMISSIONS(env, permission::PermissionScope::kNet, "");
   int err = uv_listen(
       reinterpret_cast<uv_stream_t*>(&wrap->handle_), backlog, OnConnection);
   args.GetReturnValue().Set(err);
@@ -223,6 +234,9 @@ void PipeWrap::Connect(const FunctionCallbackInfo<Value>& args) {
 
   Local<Object> req_wrap_obj = args[0].As<Object>();
   node::Utf8Value name(env->isolate(), args[1]);
+
+  ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS(
+      env, permission::PermissionScope::kNet, name.ToStringView(), args);
 
   ConnectWrap* req_wrap =
       new ConnectWrap(env, req_wrap_obj, AsyncWrap::PROVIDER_PIPECONNECTWRAP);

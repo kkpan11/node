@@ -115,7 +115,7 @@
  *     - If `cookie.unsupported_ts` evaluates less than
  *       `COOKIE_UNSUPPORTED_TIMEOUT`
  *        - Ensure there is no EDNS cookie opt (10) set (shouldn't be unless
- *          requestor had put this themselves), then **skip any remaining
+ *          requester had put this themselves), then **skip any remaining
  *          processing** as we don't want to try to send cookies.
  *     - Otherwise:
  *       - clear all cookie settings, set `cookie.state = INITIAL`.
@@ -217,7 +217,7 @@ static const unsigned char *
 
 static ares_bool_t timeval_is_set(const ares_timeval_t *tv)
 {
-  if (tv->sec != 0 && tv->usec != 0) {
+  if (tv->sec != 0 || tv->usec != 0) {
     return ARES_TRUE;
   }
   return ARES_FALSE;
@@ -229,7 +229,7 @@ static ares_bool_t timeval_expired(const ares_timeval_t *tv,
 {
   ares_int64_t   tvdiff_ms;
   ares_timeval_t tvdiff;
-  ares__timeval_diff(&tvdiff, tv, now);
+  ares_timeval_diff(&tvdiff, tv, now);
 
   tvdiff_ms = tvdiff.sec * 1000 + tvdiff.usec / 1000;
   if (tvdiff_ms >= (ares_int64_t)millsecs) {
@@ -249,7 +249,7 @@ static void ares_cookie_generate(ares_cookie_t *cookie, ares_conn_t *conn,
 {
   ares_channel_t *channel = conn->server->channel;
 
-  ares__rand_bytes(channel->rand_state, cookie->client, sizeof(cookie->client));
+  ares_rand_bytes(channel->rand_state, cookie->client, sizeof(cookie->client));
   memcpy(&cookie->client_ts, now, sizeof(cookie->client_ts));
   memcpy(&cookie->client_ip, &conn->self_ip, sizeof(cookie->client_ip));
 }
@@ -324,7 +324,7 @@ ares_status_t ares_cookie_apply(ares_dns_record_t *dnsrec, ares_conn_t *conn,
   if (cookie->state == ARES_COOKIE_UNSUPPORTED) {
     /* If timer hasn't expired, just delete any possible cookie and return */
     if (!timeval_expired(&cookie->unsupported_ts, now,
-                         COOKIE_REGRESSION_TIMEOUT_MS)) {
+                         COOKIE_UNSUPPORTED_TIMEOUT_MS)) {
       ares_dns_rr_del_opt_byid(rr, ARES_RR_OPT_OPTIONS, ARES_OPT_PARAM_COOKIE);
       return ARES_SUCCESS;
     }
@@ -369,7 +369,8 @@ ares_status_t ares_cookie_apply(ares_dns_record_t *dnsrec, ares_conn_t *conn,
 
 ares_status_t ares_cookie_validate(ares_query_t            *query,
                                    const ares_dns_record_t *dnsresp,
-                                   ares_conn_t *conn, const ares_timeval_t *now)
+                                   ares_conn_t *conn, const ares_timeval_t *now,
+                                   ares_array_t **requeue)
 {
   ares_server_t           *server = conn->server;
   ares_cookie_t           *cookie = &server->cookie;
@@ -426,9 +427,9 @@ ares_status_t ares_cookie_validate(ares_query_t            *query,
 
     /* Resend the request, hopefully it will work the next time as we should
      * have recorded a server cookie */
-    ares__requeue_query(query, now, ARES_SUCCESS,
-                        ARES_FALSE /* Don't increment try count */,
-                        NULL);
+    ares_requeue_query(query, now, ARES_SUCCESS,
+                       ARES_FALSE /* Don't increment try count */, NULL,
+                       requeue);
 
     /* Parent needs to drop this response */
     return ARES_EBADRESP;

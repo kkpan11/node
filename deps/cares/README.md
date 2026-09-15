@@ -1,7 +1,7 @@
 # [![c-ares logo](https://c-ares.org/art/c-ares-logo.svg)](https://c-ares.org/)
 
-[![Build Status](https://api.cirrus-ci.com/github/c-ares/c-ares.svg?branch=main)](https://cirrus-ci.com/github/c-ares/c-ares)
-[![Windows Build Status](https://ci.appveyor.com/api/projects/status/aevgc5914tm72pvs/branch/main?svg=true)](https://ci.appveyor.com/project/c-ares/c-ares/branch/main)
+[![Build Status](https://github.com/c-ares/c-ares/actions/workflows/ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/c-ares/c-ares/actions/workflows/ubuntu-latest.yml)
+[![Windows Build Status](https://github.com/c-ares/c-ares/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/c-ares/c-ares/actions/workflows/windows.yml)
 [![Coverage Status](https://coveralls.io/repos/github/c-ares/c-ares/badge.svg?branch=main)](https://coveralls.io/github/c-ares/c-ares?branch=main)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/291/badge)](https://bestpractices.coreinfrastructure.org/projects/291)
 [![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/c-ares.svg)](https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:c-ares)
@@ -82,7 +82,7 @@ to sign releases):
 
 ```bash
 gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 27EDEAF22F3ABCEB50DB9A125CC908FDB71E12C2 # Daniel Stenberg
-gpg --keyserver hkps://keys.openpgp.org --recv-keys DA7D64E4C82C6294CB73A20E22E3D13B5411B7CA     # Brad House
+gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys DA7D64E4C82C6294CB73A20E22E3D13B5411B7CA # Brad House
 ```
 
 ### Verifying signatures
@@ -109,8 +109,11 @@ gpg: binary signature, digest algorithm SHA512, key algorithm rsa2048
 ```
 
 ## Features
+
+See [Features](FEATURES.md)
+
 ### Supported RFCs and Proposals
-- [RFC1035](https://datatracker.ietf.org/doc/html/rfc7873).
+- [RFC1035](https://datatracker.ietf.org/doc/html/rfc1035).
   Initial/Base DNS RFC
 - [RFC2671](https://datatracker.ietf.org/doc/html/rfc2671),
   [RFC6891](https://datatracker.ietf.org/doc/html/rfc6891).
@@ -151,3 +154,5 @@ gpg: binary signature, digest algorithm SHA512, key algorithm rsa2048
   IPv6 address sorting as used by `ares_getaddrinfo()`.
 - [RFC7413](https://datatracker.ietf.org/doc/html/rfc7413).
   TCP FastOpen (TFO) for 0-RTT TCP Connection Resumption.
+- [RFC3986](https://datatracker.ietf.org/doc/html/rfc3986).
+  Uniform Resource Identifier (URI). Used for server configuration.

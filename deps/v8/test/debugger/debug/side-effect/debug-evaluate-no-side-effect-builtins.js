@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --js-explicit-resource-management
+// Flags: --js-staging
 
 Debug = debug.Debug
 
@@ -19,6 +19,7 @@ var pure_function = function(x) { return x * x; };
 var unpure_function = function(x) { array.push(x); };
 var stack = new DisposableStack();
 var regexp = /\d/g;
+var async_stack = new AsyncDisposableStack();
 
 function listener(event, exec_state, event_data, data) {
   if (event != Debug.DebugEvent.Break) return;
@@ -156,13 +157,20 @@ function listener(event, exec_state, event_data, data) {
 
     // Test Math functions.
     for (f of Object.getOwnPropertyNames(Math)) {
-      if (f !== "random" && typeof Math[f] === "function") {
-        var result = exec_state.frame(0).evaluate(
-                         `Math.${f}(0.5, -0.5);`, true).value();
-        assertEquals(Math[f](0.5, -0.5), result);
+      if (typeof Math[f] === "function") {
+        if (f == "random") {
+          fail("Math.random();");
+        } else if (f == "sumPrecise") {
+          var result = exec_state.frame(0).evaluate(
+                           `Math.${f}([0.5, -0.5]);`, true).value();
+          assertEquals(Math[f]([0.5, -0.5]), result);
+        } else {
+          var result = exec_state.frame(0).evaluate(
+                           `Math.${f}(0.5, -0.5);`, true).value();
+          assertEquals(Math[f](0.5, -0.5), result);
+        }
       }
     }
-    fail("Math.random();");
 
     // Test Number functions.
     success(new Number(0), `new Number()`);
@@ -266,6 +274,10 @@ function listener(event, exec_state, event_data, data) {
     // Test DisposableStack functions.
     success({}, `new DisposableStack()`);
     success(false, `stack.disposed`);
+
+    // Test AsyncDisposableStack functions.
+    success({}, `new AsyncDisposableStack()`);
+    success(false, `async_stack.disposed`);
   } catch (e) {
     exception = e;
     print(e, e.stack);

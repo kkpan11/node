@@ -20,7 +20,7 @@
         'v8.gyp:v8_libbase',
         'v8.gyp:v8_libplatform',
         'v8.gyp:generate_bytecode_builtins_list',
-        'v8.gyp:v8_abseil',
+        'v8.gyp:fp16',
       ],
       # Generated source files need this explicitly:
       'include_dirs+': [
@@ -40,7 +40,7 @@
         }],
         ['(OS=="linux" or OS=="mac" or OS=="freebsd" or OS=="netbsd" \
            or OS=="openbsd" or OS=="solaris" or OS=="android" \
-           or OS=="qnx" or OS=="aix" or OS=="os400")', {
+           or OS=="qnx" or OS=="aix" or OS=="os400" or OS=="openharmony")', {
              'sources': [ '<(V8_ROOT)/src/d8/d8-posix.cc', ]
            }],
         [ 'OS=="win"', {
@@ -65,6 +65,19 @@
         # Avoid excessive LTO
         ['enable_lto=="true"', {
           'ldflags': [ '-fno-lto' ],
+        }],
+        ['node_with_ltcg=="true" or enable_lto=="true" or enable_thin_lto=="true"', {
+          'msvs_settings': {
+            'VCCLCompilerTool': {
+              'AdditionalOptions': ['-fno-lto'],
+            },
+            'VCLinkerTool': {
+              'AdditionalOptions': ['-fno-lto'],
+            },
+          },
+        }],
+        ['node_shared_abseil=="false"', {
+          'dependencies': ['abseil.gyp:abseil'],
         }],
       ],
     },

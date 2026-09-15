@@ -3,8 +3,9 @@
 
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
-#include "crypto/crypto_util.h"
 #include "async_wrap.h"
+#include "crypto/crypto_keys.h"
+#include "crypto/crypto_util.h"
 #include "env.h"
 #include "memory_tracker.h"
 #include "v8.h"
@@ -25,12 +26,12 @@ namespace crypto {
 // The iteration count should be as high as possible.
 
 struct PBKDF2Config final : public MemoryRetainer {
-  CryptoJobMode mode;
+  KeyObjectData key;
   ByteSource pass;
   ByteSource salt;
   int32_t iterations;
   int32_t length;
-  const EVP_MD* digest = nullptr;
+  ncrypto::Digest digest;
 
   PBKDF2Config() = default;
 
@@ -55,10 +56,11 @@ struct PBKDF2Traits final {
       unsigned int offset,
       PBKDF2Config* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const PBKDF2Config& params,
-      ByteSource* out);
+  static bool DeriveBits(Environment* env,
+                         const PBKDF2Config& params,
+                         ByteSource* out,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const PBKDF2Config& params,

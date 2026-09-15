@@ -32,12 +32,6 @@ static icu::CalendarCache *gNewYearCache = nullptr;
 static icu::TimeZone *gAstronomerTimeZone = nullptr;
 static icu::UInitOnce gAstronomerTimeZoneInitOnce {};
 
-/**
- * The start year of the Korean traditional calendar (Dan-gi) is the inaugural
- * year of Dan-gun (BC 2333).
- */
-static const int32_t DANGI_EPOCH_YEAR = -2332; // Gregorian year
-
 U_CDECL_BEGIN
 static UBool calendar_dangi_cleanup() {
     if (gWinterSolsticeCache) {
@@ -122,9 +116,9 @@ const char *DangiCalendar::getType() const {
  */
 static void U_CALLCONV initAstronomerTimeZone(UErrorCode &status) {
     U_ASSERT(gAstronomerTimeZone == nullptr);
-    const UDate millis1897[] = { (UDate)((1897 - 1970) * 365 * kOneDay) }; // some days of error is not a problem here
-    const UDate millis1898[] = { (UDate)((1898 - 1970) * 365 * kOneDay) }; // some days of error is not a problem here
-    const UDate millis1912[] = { (UDate)((1912 - 1970) * 365 * kOneDay) }; // this doesn't create an issue for 1911/12/20
+    const UDate millis1897[] = { static_cast<UDate>((1897 - 1970) * 365 * kOneDay) }; // some days of error is not a problem here
+    const UDate millis1898[] = { static_cast<UDate>((1898 - 1970) * 365 * kOneDay) }; // some days of error is not a problem here
+    const UDate millis1912[] = { static_cast<UDate>((1912 - 1970) * 365 * kOneDay) }; // this doesn't create an issue for 1911/12/20
     LocalPointer<InitialTimeZoneRule> initialTimeZone(new InitialTimeZoneRule(
         UnicodeString(u"GMT+8"), 8*kOneHour, 0), status);
 
@@ -158,29 +152,8 @@ const TimeZone* getAstronomerTimeZone(UErrorCode &status) {
     return gAstronomerTimeZone;
 }
 
-constexpr uint32_t kDangiRelatedYearDiff = -2333;
-
-int32_t DangiCalendar::getRelatedYear(UErrorCode &status) const
-{
-    int32_t year = get(UCAL_EXTENDED_YEAR, status);
-    if (U_FAILURE(status)) {
-        return 0;
-    }
-    if (uprv_add32_overflow(year, kDangiRelatedYearDiff, &year)) {
-        status = U_ILLEGAL_ARGUMENT_ERROR;
-        return 0;
-    }
-    return year;
-}
-
-void DangiCalendar::setRelatedYear(int32_t year)
-{
-    // set extended year
-    set(UCAL_EXTENDED_YEAR, year - kDangiRelatedYearDiff);
-}
-
 ChineseCalendar::Setting DangiCalendar::getSetting(UErrorCode& status) const {
-  return { DANGI_EPOCH_YEAR,
+  return {
     getAstronomerTimeZone(status),
     &gWinterSolsticeCache, &gNewYearCache
   };

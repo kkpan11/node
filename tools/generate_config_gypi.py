@@ -19,11 +19,7 @@ import getnapibuildversion
 
 # Regex used for parsing results of "gn args".
 GN_RE = re.compile(r'(\w+)\s+=\s+(.*?)$', re.MULTILINE)
-
-if sys.platform == 'win32':
-  GN = 'gn.exe'
-else:
-  GN = 'gn'
+GN = 'gn.bat' if sys.platform == 'win32' else 'gn'
 
 def bool_to_number(v):
   return 1 if v else 0
@@ -62,27 +58,29 @@ def translate_config(out_dir, config, v8_config):
       'llvm_version': 13,
       'napi_build_version': config['napi_build_version'],
       'node_builtin_shareable_builtins':
-          eval(config['node_builtin_shareable_builtins']),
+          json.loads(config['node_builtin_shareable_builtins']),
       'node_module_version': int(config['node_module_version']),
       'node_use_openssl': config['node_use_openssl'],
+      'node_use_amaro': config['node_use_amaro'],
       'node_use_node_code_cache': config['node_use_node_code_cache'],
       'node_use_node_snapshot': config['node_use_node_snapshot'],
       'v8_enable_inspector':  # this is actually a node misnomer
           bool_string_to_number(config['node_enable_inspector']),
       'shlib_suffix': 'dylib' if sys.platform == 'darwin' else 'so',
       'tsan': bool_string_to_number(config['is_tsan']),
-      # TODO(zcbenz): Shared components are not supported in GN config yet.
       'node_shared': 'false',
-      'node_shared_brotli': 'false',
-      'node_shared_cares': 'false',
-      'node_shared_http_parser': 'false',
-      'node_shared_libuv': 'false',
-      'node_shared_nghttp2': 'false',
+      'node_shared_brotli': config['node_shared_brotli'],
+      'node_shared_cares': config['node_shared_cares'],
+      'node_shared_hdr_histogram': config['node_shared_hdr_histogram'],
+      'node_shared_http_parser': config['node_shared_http_parser'],
+      'node_shared_libuv': config['node_shared_libuv'],
+      'node_shared_nghttp2': config['node_shared_nghttp2'],
       'node_shared_nghttp3': 'false',
       'node_shared_ngtcp2': 'false',
       'node_shared_openssl': 'false',
-      'node_shared_sqlite': 'false',
+      'node_shared_sqlite': config['node_shared_sqlite'],
       'node_shared_zlib': 'false',
+      'node_shared_zstd': config['node_shared_zstd'],
     }
   }
   config_gypi['variables'].update(v8_config)
@@ -98,14 +96,15 @@ def main():
                       default='//node')
   parser.add_argument('--dep-file', help='path to an optional dep file',
                       default=None)
-  args, unknown_args = parser.parse_known_args()
+  args, _unknown_args = parser.parse_known_args()
 
   config = get_gn_config(args.out_dir)
   v8_config = get_v8_config(args.out_dir, args.node_gn_path)
 
   # Write output.
   with open(args.target, 'w') as f:
-    f.write(repr(translate_config(args.out_dir, config, v8_config)))
+    f.write(json.dumps(translate_config(args.out_dir, config, v8_config),
+                       sort_keys=True))
 
   # Write depfile. Force regenerating config.gypi when GN configs change.
   if args.dep_file:

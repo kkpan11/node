@@ -111,7 +111,7 @@ ares_bool_t ares_dns_rec_type_isvalid(ares_dns_rec_type_t type,
   return is_query ? ARES_TRUE : ARES_FALSE;
 }
 
-ares_bool_t ares_dns_rec_type_allow_name_compression(ares_dns_rec_type_t type)
+ares_bool_t ares_dns_rec_allow_name_comp(ares_dns_rec_type_t type)
 {
   /* Only record types defined in RFC1035 allow name compression within the
    * RDATA.  Otherwise nameservers that don't understand an RR may not be
@@ -147,7 +147,7 @@ ares_bool_t ares_dns_class_isvalid(ares_dns_class_t    qclass,
   switch (qclass) {
     case ARES_CLASS_IN:
     case ARES_CLASS_CHAOS:
-    case ARES_CLASS_HESOID:
+    case ARES_CLASS_HESIOD:
     case ARES_CLASS_NONE:
       return ARES_TRUE;
     case ARES_CLASS_ANY:
@@ -228,7 +228,7 @@ const char *ares_dns_rec_type_tostr(ares_dns_rec_type_t type)
     case ARES_REC_TYPE_CAA:
       return "CAA";
     case ARES_REC_TYPE_RAW_RR:
-      return "RAWRR";
+      return "RAW_RR";
   }
   return "UNKNOWN";
 }
@@ -240,7 +240,7 @@ const char *ares_dns_class_tostr(ares_dns_class_t qclass)
       return "IN";
     case ARES_CLASS_CHAOS:
       return "CH";
-    case ARES_CLASS_HESOID:
+    case ARES_CLASS_HESIOD:
       return "HS";
     case ARES_CLASS_ANY:
       return "ANY";
@@ -670,7 +670,7 @@ ares_bool_t ares_dns_class_fromstr(ares_dns_class_t *qclass, const char *str)
   } list[] = {
     { "IN",   ARES_CLASS_IN     },
     { "CH",   ARES_CLASS_CHAOS  },
-    { "HS",   ARES_CLASS_HESOID },
+    { "HS",   ARES_CLASS_HESIOD },
     { "NONE", ARES_CLASS_NONE   },
     { "ANY",  ARES_CLASS_ANY    },
     { NULL,   0                 }
@@ -681,7 +681,7 @@ ares_bool_t ares_dns_class_fromstr(ares_dns_class_t *qclass, const char *str)
   }
 
   for (i = 0; list[i].name != NULL; i++) {
-    if (strcasecmp(list[i].name, str) == 0) {
+    if (ares_strcaseeq(list[i].name, str)) {
       *qclass = list[i].qclass;
       return ARES_TRUE;
     }
@@ -726,7 +726,7 @@ ares_bool_t ares_dns_rec_type_fromstr(ares_dns_rec_type_t *qtype,
   }
 
   for (i = 0; list[i].name != NULL; i++) {
-    if (strcasecmp(list[i].name, str) == 0) {
+    if (ares_strcaseeq(list[i].name, str)) {
       *qtype = list[i].type;
       return ARES_TRUE;
     }

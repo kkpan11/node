@@ -1,5 +1,3 @@
-// Flags: --expose-internals
-
 'use strict';
 
 const common = require('../common');
@@ -9,9 +7,9 @@ const {
   Transform,
   Writable,
   finished,
+  compose,
   PassThrough
 } = require('stream');
-const compose = require('internal/streams/compose');
 const assert = require('assert');
 
 {
@@ -221,9 +219,9 @@ const assert = require('assert');
   .end(true)
   .on('data', common.mustNotCall())
   .on('end', common.mustNotCall())
-  .on('error', (err) => {
+  .on('error', common.mustCall((err) => {
     assert.strictEqual(err, _err);
-  });
+  }));
 }
 
 {
@@ -253,9 +251,9 @@ const assert = require('assert');
   .end(true)
   .on('data', common.mustNotCall())
   .on('end', common.mustNotCall())
-  .on('error', (err) => {
+  .on('error', common.mustCall((err) => {
     assert.strictEqual(err, _err);
-  });
+  }));
 }
 
 {
@@ -492,7 +490,7 @@ const assert = require('assert');
 
     newStream.end();
 
-    assert.deepStrictEqual(await newStream.toArray(), [Buffer.from('Steve RogersOn your left')]);
+    assert.deepStrictEqual(await newStream.toArray(), [Buffer.from('Steve Rogers'), Buffer.from('On your left')]);
   })().then(common.mustCall());
 }
 
@@ -538,4 +536,25 @@ const assert = require('assert');
   composed.destroy(new Error('an unexpected error'));
   assert.strictEqual(duplex.destroyed, true);
 
+}
+
+// Regression test: compose with a web TransformStream tail must always emit
+// null (EOF) when the source finishes. The done check must precede the
+// backpressure check in the reader.read() loop; otherwise push(null) can be
+// skipped if canPushMore() returns false on the final done:true read.
+{
+  const { TransformStream } = globalThis;
+  const { Readable } = require('stream');
+
+  // A web TransformStream as the tail exercises the isWebStream code path
+  // in compose that loops over reader.read() results.
+  const ts = new TransformStream();
+  const src = Readable.from(['hello', ' ', 'world']);
+  const composed = compose(src, ts);
+
+  let result = '';
+  composed.on('data', (chunk) => { result += Buffer.from(chunk).toString(); });
+  composed.on('end', common.mustCall(() => {
+    assert.strictEqual(result, 'hello world');
+  }));
 }

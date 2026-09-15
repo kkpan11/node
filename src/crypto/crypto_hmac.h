@@ -36,16 +36,15 @@ class Hmac : public BaseObject {
   static void Sign(const v8::FunctionCallbackInfo<v8::Value>& args);
 
  private:
-  HMACCtxPointer ctx_;
+  ncrypto::HMACCtxPointer ctx_;
 };
 
 struct HmacConfig final : public MemoryRetainer {
-  CryptoJobMode job_mode;
   SignConfiguration::Mode mode;
   KeyObjectData key;
   ByteSource data;
   ByteSource signature;
-  const EVP_MD* digest;
+  ncrypto::Digest digest;
 
   HmacConfig() = default;
 
@@ -73,10 +72,11 @@ struct HmacTraits final {
       unsigned int offset,
       HmacConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const HmacConfig& params,
-      ByteSource* out);
+  static bool DeriveBits(Environment* env,
+                         const HmacConfig& params,
+                         ByteSource* out,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const HmacConfig& params,

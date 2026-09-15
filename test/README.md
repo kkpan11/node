@@ -38,7 +38,7 @@ For the tests to run on Windows, be sure to clone Node.js source code with the
 | `tick-processor` | No         | Tests for the V8 tick processor integration.[^4]                                                              |
 | `v8-updates`     | No         | Tests for V8 performance integration.                                                                         |
 
-[^1]: [Documentation](./common/README.md)
+[^1]: [Documentation](../test/common/README.md)
 
 [^2]: Tests for networking related modules may also be present in other directories, but those tests do
     not make outbound connections.
@@ -46,7 +46,7 @@ For the tests to run on Windows, be sure to clone Node.js source code with the
 [^3]: All tests inside of this directory are expected to fail. If a test doesn't fail on certain platforms,
     those should be skipped via `known_issues.status`.
 
-[^4]: The tests are for the logic in `lib/internal/v8_prof_processor.js` and `lib/internal/v8_prof_polyfill.js`.
+[^4]: The tests are for the logic in `lib/internal/main/prof_process.js` and `lib/internal/v8_prof_polyfill.js`.
     The tests confirm that the profile processor packages the correct set of scripts from V8 and introduces the
     correct platform specific logic.
 

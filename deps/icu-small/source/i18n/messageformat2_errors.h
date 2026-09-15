@@ -15,6 +15,8 @@
  * \brief C++ API: Formats messages using the draft MessageFormat 2.0.
  */
 
+#if !UCONFIG_NO_NORMALIZATION
+
 #if !UCONFIG_NO_FORMATTING
 
 #if !UCONFIG_NO_MF2
@@ -54,18 +56,28 @@ namespace message2 {
     enum StaticErrorType {
         DuplicateDeclarationError,
         DuplicateOptionName,
+        DuplicateVariant,
         MissingSelectorAnnotation,
         NonexhaustivePattern,
         SyntaxError,
-        UnsupportedStatementError,
         VariantKeyMismatchError
     };
 
     enum DynamicErrorType {
         UnresolvedVariable,
         FormattingError,
+        BadOptionError,
+        /**
+           This is used to signal errors from :number and :integer when a
+            bad `select` option is passed. In this case, fallback output
+            is not used, so it must be distinguished from a regular bad
+            option error (but it maps to a bad option error in the final
+            error code).
+            See https://github.com/unicode-org/message-format-wg/blob/main/spec/functions/number.md#number-selection
+            "The formatting of the _resolved value_ is not affected by the `select` option.")
+        */
+        RecoverableBadOptionError,
         OperandMismatchError,
-        ReservedError,
         SelectorError,
         UnknownFunction,
     };
@@ -99,8 +111,9 @@ namespace message2 {
         bool hasSyntaxError() const { return syntaxError; }
         bool hasMissingSelectorAnnotationError() const { return missingSelectorAnnotationError; }
         void addError(StaticError&&, UErrorCode&);
-        void checkErrors(UErrorCode&);
+        void checkErrors(UErrorCode&) const;
 
+        void clear();
         const StaticError& first() const;
         StaticErrors(const StaticErrors&, UErrorCode&);
         StaticErrors(StaticErrors&&) noexcept;
@@ -112,6 +125,7 @@ namespace message2 {
         const StaticErrors& staticErrors;
         LocalPointer<UVector> resolutionAndFormattingErrors;
         bool formattingError = false;
+        bool badOptionError = false;
         bool selectorError = false;
         bool unknownFunctionError = false;
         bool unresolvedVariableError = false;
@@ -121,15 +135,17 @@ namespace message2 {
 
         int32_t count() const;
         void setSelectorError(const FunctionName&, UErrorCode&);
-        void setReservedError(UErrorCode&);
         void setUnresolvedVariable(const VariableName&, UErrorCode&);
         void setUnknownFunction(const FunctionName&, UErrorCode&);
         void setFormattingError(const FunctionName&, UErrorCode&);
         // Used when the name of the offending formatter is unknown
         void setFormattingError(UErrorCode&);
+        void setBadOption(const FunctionName&, UErrorCode&);
+        void setRecoverableBadOption(const FunctionName&, UErrorCode&);
         void setOperandMismatchError(const FunctionName&, UErrorCode&);
         bool hasDataModelError() const { return staticErrors.hasDataModelError(); }
         bool hasFormattingError() const { return formattingError; }
+        bool hasBadOptionError() const { return badOptionError; }
         bool hasSelectorError() const { return selectorError; }
         bool hasSyntaxError() const { return staticErrors.hasSyntaxError(); }
         bool hasUnknownFunctionError() const { return unknownFunctionError; }
@@ -151,6 +167,8 @@ U_NAMESPACE_END
 #endif /* #if !UCONFIG_NO_MF2 */
 
 #endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */
 
 #endif /* U_SHOW_CPLUSPLUS_API */
 

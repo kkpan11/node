@@ -1,4 +1,4 @@
-// Flags: --expose-internals --stack-size=64
+// Flags: --expose-internals
 'use strict';
 require('../common');
 const assert = require('assert');
@@ -39,6 +39,10 @@ assert.strictEqual(cycle(new ReferenceError('foo')).name, 'ReferenceError');
 assert.strictEqual(cycle(new URIError('foo')).name, 'URIError');
 assert.strictEqual(cycle(new EvalError('foo')).name, 'EvalError');
 assert.strictEqual(cycle(new SyntaxError('foo')).name, 'SyntaxError');
+const aggregate = cycle(new AggregateError([new Error('inner')], 'aggregate'));
+assert(aggregate instanceof AggregateError);
+assert.strictEqual(aggregate.message, 'aggregate');
+assert.strictEqual(aggregate.errors[0].message, 'inner');
 
 class SubError extends Error {}
 
@@ -59,7 +63,7 @@ class ErrorWithThowingCause extends Error {
 }
 class ErrorWithCyclicCause extends Error {
   get cause() {
-    return new ErrorWithCyclicCause();
+    return this;
   }
 }
 const errorWithCause = Object
@@ -83,14 +87,18 @@ assert.strictEqual(Object.hasOwn(cycle(errorWithCyclicCause), 'cause'), true);
 assert.deepStrictEqual(cycle(new ErrorWithCause('Error with cause')).cause, new Error('err'));
 assert.strictEqual(cycle(new ErrorWithThowingCause('Error with cause')).cause, undefined);
 assert.strictEqual(Object.hasOwn(cycle(new ErrorWithThowingCause('Error with cause')), 'cause'), false);
-// When the cause is cyclic, it is serialized until Maxiumum call stack size is reached
+// When the cause is cyclic, it is serialized as a dumb circular reference object.
 let depth = 0;
 let e = cycle(new ErrorWithCyclicCause('Error with cause'));
 while (e.cause) {
   e = e.cause;
   depth++;
 }
-assert(depth > 1);
+assert.strictEqual(depth, 1);
+assert.strictEqual(
+  inspect(cycle(new ErrorWithCyclicCause('Error with cause')).cause),
+  '[Circular object]',
+);
 
 
 {
@@ -122,7 +130,7 @@ const data = {
   foo: 'bar',
   [inspect.custom]() {
     return 'barbaz';
-  }
+  },
 };
 assert.strictEqual(inspect(cycle(data)), 'barbaz');
 

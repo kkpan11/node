@@ -40,7 +40,7 @@ U_NAMESPACE_BEGIN
  * solar year (approximately 365.24 days) is not an even multiple of
  * the lunar month (approximately 29.53 days) an extra "leap month" is
  * inserted in 7 out of every 19 years.  To make matters even more
- * interesting, the start of a year can be delayed by up to three days
+ * interesting, the start of a year can be delayed by up to two days
  * in order to prevent certain holidays from falling on the Sabbath and
  * to prevent certain illegal year lengths.  Finally, the lengths of certain
  * months can vary depending on the number of days in the year.
@@ -273,21 +273,11 @@ public:
      */
     static UBool isLeapYear(int32_t year) ;
 
-    /**
-     * @return      The related Gregorian year; will be obtained by modifying the value
-     *              obtained by get from UCAL_EXTENDED_YEAR field
-     * @internal
-     */
-    virtual int32_t getRelatedYear(UErrorCode &status) const override;
-
-    /**
-     * @param year  The related Gregorian year to set; will be modified as necessary then
-     *              set in UCAL_EXTENDED_YEAR field
-     * @internal
-     */
-    virtual void setRelatedYear(int32_t year) override;
-
  protected:
+    /**
+     * @internal
+     */
+    int32_t getRelatedYearDifference() const override;
 
     /**
      * Subclass API for defining limits of different types.
@@ -326,9 +316,10 @@ public:
      * calendar system.  Subclasses should override this method if they can
      * provide a more correct or more efficient implementation than the
      * default implementation in Calendar.
-     * @stable ICU 2.0
+     * @internal
      */
-    virtual int32_t handleGetYearLength(int32_t eyear) const override;
+    virtual int32_t handleGetYearLength(int32_t eyear, UErrorCode& status) const override;
+
     /**
      * Subclasses may override this method to compute several fields
      * specific to each calendar system.  These are:
@@ -427,44 +418,6 @@ public:
 
  protected:
    virtual int32_t internalGetMonth(UErrorCode& status) const override;
-
- private: // Calendar-specific implementation
-    /**
-     * Finds the day # of the first day in the given Hebrew year.
-     * To do this, we want to calculate the time of the Tishri 1 new moon
-     * in that year.
-     * <p>
-     * The algorithm here is similar to ones described in a number of
-     * references, including:
-     * <ul>
-     * <li>"Calendrical Calculations", by Nachum Dershowitz & Edward Reingold,
-     *     Cambridge University Press, 1997, pages 85-91.
-     *
-     * <li>Hebrew Calendar Science and Myths,
-     *     <a href="http://www.geocities.com/Athens/1584/">
-     *     http://www.geocities.com/Athens/1584/</a>
-     *
-     * <li>The Calendar FAQ,
-     *      <a href="http://www.faqs.org/faqs/calendars/faq/">
-     *      http://www.faqs.org/faqs/calendars/faq/</a>
-     * </ul>
-     * @param year extended year
-     * @return day number (JD)
-     * @internal
-     */
-    static int32_t startOfYear(int32_t year, UErrorCode& status);
-
-    static int32_t absoluteDayToDayOfWeek(int32_t day) ;
-    
-    /**
-     * @internal 
-     */
-    int32_t yearType(int32_t year) const;
-
-    /**
-     * @internal 
-     */
-    static int32_t monthsInYear(int32_t year) ;
 };
 
 U_NAMESPACE_END

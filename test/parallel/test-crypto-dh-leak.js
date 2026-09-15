@@ -12,8 +12,8 @@ const crypto = require('crypto');
 
 const before = process.memoryUsage.rss();
 {
-  const size = common.hasFipsCrypto || common.hasOpenSSL3 ? 1024 : 256;
-  const dh = crypto.createDiffieHellman(size);
+  const prime = crypto.getDiffieHellman('modp14').getPrime();
+  const dh = crypto.createDiffieHellman(prime);
   const publicKey = dh.generateKeys();
   const privateKey = dh.getPrivateKey();
   for (let i = 0; i < 5e4; i += 1) {
@@ -21,7 +21,7 @@ const before = process.memoryUsage.rss();
     dh.setPrivateKey(privateKey);
   }
 }
-global.gc();
+globalThis.gc();
 const after = process.memoryUsage.rss();
 
 // RSS should stay the same, ceteris paribus, but allow for

@@ -15,12 +15,12 @@ function cleanupStaleProcess(filename) {
   process.once('beforeExit', () => {
     const basename = filename.replace(/.*[/\\]/g, '');
     try {
-      execFileSync(`${process.env.SystemRoot}\\System32\\wbem\\WMIC.exe`, [
-        'process',
-        'where',
-        `commandline like '%${basename}%child'`,
-        'delete',
-        '/nointeractive',
+      execFileSync(`${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`, [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%${basename}%child'" | ` +
+        'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }',
       ]);
     } catch {
       // Ignore failures, there might not be any stale process to clean up.
@@ -80,14 +80,28 @@ function expectSyncExit(caller, spawnArgs, {
   function logAndThrow() {
     const tag = `[process ${child.pid}]:`;
     console.error(`${tag} --- stderr ---`);
-    console.error(stderrStr === undefined ? child.stderr.toString() : stderrStr);
+    console.error(stderrStr === undefined ? (child.stderr?.toString() ?? '') : stderrStr);
     console.error(`${tag} --- stdout ---`);
-    console.error(stdoutStr === undefined ? child.stdout.toString() : stdoutStr);
+    console.error(stdoutStr === undefined ? (child.stdout?.toString() ?? '') : stdoutStr);
     console.error(`${tag} status = ${child.status}, signal = ${child.signal}`);
 
     const error = new Error(`${failures.join('\n')}`);
-    if (spawnArgs[2]) {
-      error.options = spawnArgs[2];
+    if (typeof spawnArgs[2] === 'object' && spawnArgs[2] !== null) {
+      const envInOptions = spawnArgs[2].env;
+      // If the env is overridden in the spawn options, include it in the error
+      // object for easier debugging.
+      if (typeof envInOptions === 'object' && envInOptions !== null && envInOptions !== process.env) {
+        // Only include the environment variables that are different from
+        // the current process.env to avoid cluttering the output.
+        error.options = { ...spawnArgs[2], env: {} };
+        for (const key of Object.keys(envInOptions)) {
+          if (envInOptions[key] !== process.env[key]) {
+            error.options.env[key] = spawnArgs[2].env[key];
+          }
+        }
+      } else {
+        error.options = spawnArgs[2];
+      }
     }
     let command = spawnArgs[0];
     if (Array.isArray(spawnArgs[1])) {

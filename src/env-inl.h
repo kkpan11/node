@@ -44,16 +44,6 @@
 
 namespace node {
 
-NoArrayBufferZeroFillScope::NoArrayBufferZeroFillScope(
-    IsolateData* isolate_data)
-    : node_allocator_(isolate_data->node_allocator()) {
-  if (node_allocator_ != nullptr) node_allocator_->zero_fill_field()[0] = 0;
-}
-
-NoArrayBufferZeroFillScope::~NoArrayBufferZeroFillScope() {
-  if (node_allocator_ != nullptr) node_allocator_->zero_fill_field()[0] = 1;
-}
-
 inline v8::Isolate* IsolateData::isolate() const {
   return isolate_;
 }
@@ -108,7 +98,7 @@ inline AliasedFloat64Array& AsyncHooks::async_ids_stack() {
 }
 
 v8::Local<v8::Array> AsyncHooks::js_execution_async_resources() {
-  if (UNLIKELY(js_execution_async_resources_.IsEmpty())) {
+  if (js_execution_async_resources_.IsEmpty()) [[unlikely]] {
     js_execution_async_resources_.Reset(
         env()->isolate(), v8::Array::New(env()->isolate()));
   }
@@ -117,7 +107,18 @@ v8::Local<v8::Array> AsyncHooks::js_execution_async_resources() {
 
 v8::Local<v8::Object> AsyncHooks::native_execution_async_resource(size_t i) {
   if (i >= native_execution_async_resources_.size()) return {};
-  return native_execution_async_resources_[i];
+  auto resource = native_execution_async_resources_[i];
+  if (std::holds_alternative<v8::Global<v8::Object>*>(resource)) [[unlikely]] {
+    auto* global = std::get<v8::Global<v8::Object>*>(resource);
+    if (global == nullptr) [[unlikely]]
+      return {};
+    return global->Get(env()->isolate());
+  } else {
+    auto* local = std::get<v8::Local<v8::Object>*>(resource);
+    if (local == nullptr) [[unlikely]]
+      return {};
+    return *local;
+  }
 }
 
 inline v8::Local<v8::String> AsyncHooks::provider_string(int idx) {
@@ -185,18 +186,18 @@ inline bool TickInfo::has_rejection_to_warn() const {
 }
 
 inline Environment* Environment::GetCurrent(v8::Isolate* isolate) {
-  if (UNLIKELY(!isolate->InContext())) return nullptr;
+  if (!isolate->InContext()) [[unlikely]]
+    return nullptr;
   v8::HandleScope handle_scope(isolate);
   return GetCurrent(isolate->GetCurrentContext());
 }
 
 inline Environment* Environment::GetCurrent(v8::Local<v8::Context> context) {
-  if (UNLIKELY(!ContextEmbedderTag::IsNodeContext(context))) {
+  if (!ContextEmbedderTag::IsNodeContext(context)) [[unlikely]] {
     return nullptr;
   }
-  return static_cast<Environment*>(
-      context->GetAlignedPointerFromEmbedderData(
-          ContextEmbedderIndex::kEnvironment));
+  return static_cast<Environment*>(context->GetAlignedPointerFromEmbedderData(
+      ContextEmbedderIndex::kEnvironment, EmbedderDataTag::kPerContextData));
 }
 
 inline Environment* Environment::GetCurrent(
@@ -212,6 +213,15 @@ inline Environment* Environment::GetCurrent(
 
 inline v8::Isolate* Environment::isolate() const {
   return isolate_;
+}
+
+inline cppgc::AllocationHandle& Environment::cppgc_allocation_handle() const {
+  return isolate_->GetCppHeap()->GetAllocationHandle();
+}
+
+inline v8::ExternalMemoryAccounter* Environment::external_memory_accounter()
+    const {
+  return external_memory_accounter_.get();
 }
 
 inline Environment* Environment::from_timer_handle(uv_timer_t* handle) {
@@ -350,6 +360,11 @@ inline ExitCode Environment::exit_code(const ExitCode default_code) const {
              : static_cast<ExitCode>(exit_info_[kExitCode]);
 }
 
+inline void Environment::set_exit_code(const ExitCode code) {
+  exit_info_[kExitCode] = static_cast<int>(code);
+  exit_info_[kHasExitCode] = 1;
+}
+
 inline AliasedInt32Array& Environment::exit_info() {
   return exit_info_;
 }
@@ -431,6 +446,10 @@ inline double Environment::get_default_trigger_async_id() {
   if (default_trigger_async_id < 0)
     default_trigger_async_id = execution_async_id();
   return default_trigger_async_id;
+}
+
+inline int64_t Environment::stack_trace_limit() const {
+  return isolate_data_->options()->stack_trace_limit;
 }
 
 inline std::shared_ptr<EnvironmentOptions> Environment::options() {
@@ -604,6 +623,10 @@ inline void Environment::set_can_call_into_js(bool can_call_into_js) {
   can_call_into_js_ = can_call_into_js;
 }
 
+inline bool Environment::is_processing_v8_interrupt() const {
+  return is_processing_v8_interrupt_;
+}
+
 inline bool Environment::has_run_bootstrapping_code() const {
   return principal_realm_->has_run_bootstrapping_code();
 }
@@ -661,7 +684,8 @@ inline bool Environment::no_global_search_paths() const {
 }
 
 inline bool Environment::should_start_debug_signal_handler() const {
-  return (flags_ & EnvironmentFlags::kNoStartDebugSignalHandler) == 0;
+  return ((flags_ & EnvironmentFlags::kNoStartDebugSignalHandler) == 0) &&
+         !options_->disable_sigusr1;
 }
 
 inline bool Environment::no_browser_globals() const {
@@ -671,14 +695,6 @@ inline bool Environment::no_browser_globals() const {
 #else
   return flags_ & EnvironmentFlags::kNoBrowserGlobals;
 #endif
-}
-
-bool Environment::filehandle_close_warning() const {
-  return emit_filehandle_warning_;
-}
-
-void Environment::set_filehandle_close_warning(bool on) {
-  emit_filehandle_warning_ = on;
 }
 
 void Environment::set_source_maps_enabled(bool on) {
@@ -691,6 +707,10 @@ bool Environment::source_maps_enabled() const {
 
 inline uint64_t Environment::thread_id() const {
   return thread_id_;
+}
+
+inline std::string_view Environment::thread_name() const {
+  return thread_name_;
 }
 
 inline worker::Worker* Environment::worker_context() const {
@@ -769,6 +789,13 @@ inline void Environment::ThrowError(
   isolate()->ThrowException(fun(OneByteString(isolate(), errmsg), {}));
 }
 
+inline void Environment::ThrowStdErrException(std::error_code error_code,
+                                              const char* syscall,
+                                              const char* path) {
+  ThrowErrnoException(
+      error_code.value(), syscall, error_code.message().c_str(), path);
+}
+
 inline void Environment::ThrowErrnoException(int errorno,
                                              const char* syscall,
                                              const char* message,
@@ -818,18 +845,44 @@ void Environment::set_process_exit_handler(
 #undef VY
 #undef VP
 
+#define V(Name, label, _, __)                                                  \
+  inline v8::Local<v8::String> IsolateData::Name##_permission_string() const { \
+    return Name##_permission_string##_.Get(isolate_);                          \
+  }
+  PERMISSIONS(V)
+#undef V
+
 #define VM(PropertyName) V(PropertyName##_binding_template, v8::ObjectTemplate)
 #define V(PropertyName, TypeName)                                              \
   inline v8::Local<TypeName> IsolateData::PropertyName() const {               \
     return PropertyName##_.Get(isolate_);                                      \
   }                                                                            \
   inline void IsolateData::set_##PropertyName(v8::Local<TypeName> value) {     \
+    CHECK(PropertyName##_.IsEmpty());                                          \
     PropertyName##_.Set(isolate_, value);                                      \
   }
   PER_ISOLATE_TEMPLATE_PROPERTIES(V)
   NODE_BINDINGS_WITH_PER_ISOLATE_INIT(VM)
 #undef V
 #undef VM
+
+  inline v8::Local<v8::Symbol> IsolateData::ffi_fast_arguments_symbol() const {
+    return ffi_fast_arguments_symbol_.Get(isolate_);
+  }
+  inline void IsolateData::set_ffi_fast_arguments_symbol(
+      v8::Local<v8::Symbol> value) {
+    CHECK(ffi_fast_arguments_symbol_.IsEmpty());
+    ffi_fast_arguments_symbol_.Set(isolate_, value);
+  }
+  inline v8::Local<v8::Symbol> IsolateData::ffi_fast_buffer_invoke_symbol()
+      const {
+    return ffi_fast_buffer_invoke_symbol_.Get(isolate_);
+  }
+  inline void IsolateData::set_ffi_fast_buffer_invoke_symbol(
+      v8::Local<v8::Symbol> value) {
+    CHECK(ffi_fast_buffer_invoke_symbol_.IsEmpty());
+    ffi_fast_buffer_invoke_symbol_.Set(isolate_, value);
+  }
 
 #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
 #define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
@@ -845,6 +898,29 @@ void Environment::set_process_exit_handler(
 #undef VS
 #undef VY
 #undef VP
+
+  inline v8::Local<v8::Symbol> Environment::ffi_fast_arguments_symbol() const {
+    return isolate_data()->ffi_fast_arguments_symbol();
+  }
+  inline void Environment::set_ffi_fast_arguments_symbol(
+      v8::Local<v8::Symbol> value) {
+    isolate_data()->set_ffi_fast_arguments_symbol(value);
+  }
+  inline v8::Local<v8::Symbol> Environment::ffi_fast_buffer_invoke_symbol()
+      const {
+    return isolate_data()->ffi_fast_buffer_invoke_symbol();
+  }
+  inline void Environment::set_ffi_fast_buffer_invoke_symbol(
+      v8::Local<v8::Symbol> value) {
+    isolate_data()->set_ffi_fast_buffer_invoke_symbol(value);
+  }
+
+#define V(Name, label, _, __)                                                  \
+  inline v8::Local<v8::String> Environment::Name##_permission_string() const { \
+    return isolate_data()->Name##_permission_string();                         \
+  }
+  PERMISSIONS(V)
+#undef V
 
 #define V(PropertyName, TypeName)                                              \
   inline v8::Local<TypeName> Environment::PropertyName() const {               \
@@ -873,7 +949,7 @@ v8::Local<v8::Context> Environment::context() const {
   return principal_realm()->context();
 }
 
-Realm* Environment::principal_realm() const {
+PrincipalRealm* Environment::principal_realm() const {
   return principal_realm_.get();
 }
 
@@ -881,44 +957,62 @@ inline void Environment::set_heap_snapshot_near_heap_limit(uint32_t limit) {
   heap_snapshot_near_heap_limit_ = limit;
 }
 
+inline void Environment::set_heap_profile_near_heap_limit(uint32_t limit) {
+  heap_profile_near_heap_limit_ = limit;
+}
+
 inline bool Environment::is_in_heapsnapshot_heap_limit_callback() const {
   return is_in_heapsnapshot_heap_limit_callback_;
 }
 
+inline bool Environment::is_in_heap_profile_near_heap_limit_callback() const {
+  return is_in_heap_profile_near_heap_limit_callback_;
+}
+
+inline bool Environment::report_exclude_env() const {
+  return options_->report_exclude_env;
+}
+
 inline void Environment::AddHeapSnapshotNearHeapLimitCallback() {
   DCHECK(!heapsnapshot_near_heap_limit_callback_added_);
+  const bool was_registered = heap_profile_near_heap_limit_callback_added_;
   heapsnapshot_near_heap_limit_callback_added_ = true;
-  isolate_->AddNearHeapLimitCallback(Environment::NearHeapLimitCallback, this);
+  if (!was_registered) {
+    isolate_->AddNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                       this);
+  }
 }
 
 inline void Environment::RemoveHeapSnapshotNearHeapLimitCallback(
     size_t heap_limit) {
   DCHECK(heapsnapshot_near_heap_limit_callback_added_);
   heapsnapshot_near_heap_limit_callback_added_ = false;
-  isolate_->RemoveNearHeapLimitCallback(Environment::NearHeapLimitCallback,
-                                        heap_limit);
+  if (!heap_profile_near_heap_limit_callback_added_) {
+    isolate_->RemoveNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                          heap_limit);
+  }
 }
 
-inline void Environment::SetAsyncResourceContextFrame(
-    std::uintptr_t async_resource_handle,
-    v8::Global<v8::Value>&& context_frame) {
-  async_resource_context_frames_.emplace(
-      std::make_pair(async_resource_handle, std::move(context_frame)));
+inline void Environment::AddHeapProfileNearHeapLimitCallback() {
+  DCHECK(!heap_profile_near_heap_limit_callback_added_);
+  const bool was_registered = heapsnapshot_near_heap_limit_callback_added_;
+  heap_profile_near_heap_limit_callback_added_ = true;
+  if (!was_registered) {
+    isolate_->AddNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                       this);
+  }
 }
 
-inline const v8::Global<v8::Value>& Environment::GetAsyncResourceContextFrame(
-    std::uintptr_t async_resource_handle) {
-  auto&& async_resource_context_frame =
-      async_resource_context_frames_.find(async_resource_handle);
-  CHECK_NE(async_resource_context_frame, async_resource_context_frames_.end());
-
-  return async_resource_context_frame->second;
+inline void Environment::RemoveHeapProfileNearHeapLimitCallback(
+    size_t heap_limit) {
+  DCHECK(heap_profile_near_heap_limit_callback_added_);
+  heap_profile_near_heap_limit_callback_added_ = false;
+  if (!heapsnapshot_near_heap_limit_callback_added_) {
+    isolate_->RemoveNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                          heap_limit);
+  }
 }
 
-inline void Environment::RemoveAsyncResourceContextFrame(
-    std::uintptr_t async_resource_handle) {
-  async_resource_context_frames_.erase(async_resource_handle);
-}
 }  // namespace node
 
 // These two files depend on each other. Including base_object-inl.h after this

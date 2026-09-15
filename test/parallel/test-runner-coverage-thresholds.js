@@ -2,6 +2,7 @@
 const common = require('../common');
 const assert = require('node:assert');
 const { spawnSync } = require('node:child_process');
+const { spawnSyncAndExit } = require('../common/child_process');
 const { readdirSync } = require('node:fs');
 const { test } = require('node:test');
 const fixtures = require('../common/fixtures');
@@ -61,6 +62,7 @@ for (const coverage of coverages) {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=25`,
       '--test-reporter', 'tap',
       fixture,
@@ -77,6 +79,7 @@ for (const coverage of coverages) {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=25`,
       '--test-reporter', reporter,
       fixture,
@@ -88,10 +91,31 @@ for (const coverage of coverages) {
     assert(!findCoverageFileForPid(result.pid));
   });
 
+  test(`test failing ${coverage.flag} with red color`, () => {
+    const result = spawnSync(process.execPath, [
+      '--test',
+      '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
+      `${coverage.flag}=99`,
+      '--test-reporter', 'spec',
+      fixture,
+    ], {
+      env: { ...process.env, FORCE_COLOR: '3' },
+    });
+
+    const stdout = result.stdout.toString();
+    // eslint-disable-next-line no-control-regex
+    const redColorRegex = /\u001b\[31mℹ Error: \d{2}\.\d{2}% \w+ coverage does not meet threshold of 99%/;
+    assert.match(stdout, redColorRegex, 'Expected red color code not found in diagnostic message');
+    assert.strictEqual(result.status, 1);
+    assert(!findCoverageFileForPid(result.pid));
+  });
+
   test(`test failing ${coverage.flag}`, () => {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=99`,
       '--test-reporter', 'tap',
       fixture,
@@ -108,6 +132,7 @@ for (const coverage of coverages) {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=99`,
       '--test-reporter', reporter,
       fixture,
@@ -123,6 +148,7 @@ for (const coverage of coverages) {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=101`,
       fixture,
     ]);
@@ -136,6 +162,7 @@ for (const coverage of coverages) {
     const result = spawnSync(process.execPath, [
       '--test',
       '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
       `${coverage.flag}=-1`,
       fixture,
     ]);
@@ -143,5 +170,27 @@ for (const coverage of coverages) {
     assert.match(result.stderr.toString(), RegExp(`The value of "${coverage.flag}`));
     assert.strictEqual(result.status, 1);
     assert(!findCoverageFileForPid(result.pid));
+  });
+
+  test(`test failing ${coverage.flag} with dot reporter`, () => {
+    const { child } = spawnSyncAndExit(process.execPath, [
+      '--test',
+      '--experimental-test-coverage',
+      '--test-coverage-exclude=!test/**',
+      `${coverage.flag}=99`,
+      '--test-reporter', 'dot',
+      fixture,
+    ], {
+      status: 1,
+      stdout(output) {
+        assert.match(
+          output,
+          RegExp(`Error: ${coverage.actual.toFixed(2)}% ${coverage.name} coverage does not meet threshold of 99%`)
+        );
+        assert.match(output, /start of coverage report/);
+        assert.match(output, /end of coverage report/);
+      },
+    });
+    assert(!findCoverageFileForPid(child.pid));
   });
 }

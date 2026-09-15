@@ -1,10 +1,16 @@
-// Flags: --experimental-permission --allow-fs-read=*
+// Flags: --permission --allow-fs-read=*
 'use strict';
 
 const common = require('../common');
-common.skipIfWorker();
-if (!common.hasCrypto)
+const { isMainThread } = require('worker_threads');
+
+if (!isMainThread) {
+  common.skip('This test only works on a main thread');
+}
+
+if (!common.hasCrypto) {
   common.skip('no crypto');
+}
 
 const assert = require('assert');
 const v8 = require('v8');
@@ -23,6 +29,24 @@ const path = require('path');
 {
   assert.throws(() => {
     v8.writeHeapSnapshot();
+  }, common.expectsError({
+    code: 'ERR_ACCESS_DENIED',
+    permission: 'FileSystemWrite',
+  }));
+}
+
+{
+  assert.throws(() => {
+    v8.setHeapSnapshotNearHeapLimit(1);
+  }, common.expectsError({
+    code: 'ERR_ACCESS_DENIED',
+    permission: 'FileSystemWrite',
+  }));
+}
+
+{
+  assert.throws(() => {
+    v8.setHeapProfileNearHeapLimit(1);
   }, common.expectsError({
     code: 'ERR_ACCESS_DENIED',
     permission: 'FileSystemWrite',

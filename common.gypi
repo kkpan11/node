@@ -12,21 +12,28 @@
     'msvs_multi_core_compile': '0',   # we do enable multicore compiles, but not using the V8 way
     'enable_pgo_generate%': '0',
     'enable_pgo_use%': '0',
+    'clang_profile_lib%': '',
     'python%': 'python',
+    'emulator%': [],
 
     'node_shared%': 'false',
+    'node_enable_v8debughelper%': 'false',
+    'node_enable_experimentals%': 'false',
     'force_dynamic_crt%': 0,
     'node_use_v8_platform%': 'true',
     'node_use_bundled_v8%': 'true',
     'node_module_version%': '',
     'node_with_ltcg%': '',
     'node_shared_openssl%': 'false',
+    'openssl_is_boringssl%': 'false',
 
     'node_tag%': '',
     'uv_library%': 'static_library',
 
     'clang%': 0,
     'error_on_warn%': 'false',
+    'suppress_all_error_on_warn%': 'false',
+    'control_flow_guard%': 'false',
 
     'openssl_product': '<(STATIC_LIB_PREFIX)openssl<(STATIC_LIB_SUFFIX)',
     'openssl_no_asm%': 0,
@@ -36,7 +43,7 @@
 
     # Reset this number to 0 on major V8 upgrades.
     # Increment by one for each non-official patch applied to deps/v8.
-    'v8_embedder_string': '-node.9',
+    'v8_embedder_string': '-node.32',
 
     ##### V8 defaults for Node.js #####
 
@@ -76,14 +83,12 @@
     'v8_win64_unwinding_info': 1,
 
     # Variables controlling external defines exposed in public headers.
-    'v8_enable_conservative_stack_scanning%': 0,
-    'v8_enable_direct_local%': 0,
     'v8_enable_map_packing%': 0,
     'v8_enable_pointer_compression_shared_cage%': 0,
+    'v8_enable_external_code_space%': 0,
     'v8_enable_sandbox%': 0,
     'v8_enable_v8_checks%': 0,
-    'v8_enable_zone_compression%': 0,
-    'v8_use_perfetto': 0,
+    'v8_use_perfetto%': 0,
     'tsan%': 0,
 
     ##### end V8 defaults #####
@@ -110,15 +115,17 @@
         'v8_base': '<(PRODUCT_DIR)/libv8_snapshot.a',
       }],
       # V8 pointer compression only supports 64bit architectures.
-      ['target_arch in "arm ia32 mips mipsel ppc"', {
+      ['target_arch in "arm ia32 mips mipsel"', {
         'v8_enable_pointer_compression': 0,
+        'v8_enable_pointer_compression_shared_cage': 0,
         'v8_enable_31bit_smis_on_64bit_arch': 0,
+        'v8_enable_external_code_space': 0,
         'v8_enable_sandbox': 0
       }],
       ['target_arch in "ppc64 s390x"', {
         'v8_enable_backtrace': 1,
       }],
-      ['OS=="linux"', {
+      ['OS=="linux" or OS=="openharmony"', {
         'node_section_ordering_info%': ''
       }],
       ['OS == "zos"', {
@@ -187,7 +194,7 @@
             ['clang==1', {
               'lto': ' -flto ', # Clang
             }, {
-              'lto': ' -flto=4 -fuse-linker-plugin -ffat-lto-objects ', # GCC
+              'lto': ' -flto=4 -ffat-lto-objects ', # GCC
             }],
           ],
         },
@@ -200,7 +207,7 @@
               'LLVM_LTO': 'YES',
             },
           }],
-          ['OS=="linux"', {
+          ['OS=="linux" or OS=="openharmony"', {
             'conditions': [
               ['node_section_ordering_info!=""', {
                 'cflags': [
@@ -228,7 +235,7 @@
             # frames otherwise, even with --call-graph dwarf.
             'cflags': [ '-fno-omit-frame-pointer' ],
           }],
-          ['OS=="linux"', {
+          ['OS=="linux" or OS=="openharmony"', {
             'conditions': [
               ['enable_pgo_generate=="true"', {
                 'cflags': ['<(pgo_generate)'],
@@ -237,6 +244,72 @@
               ['enable_pgo_use=="true"', {
                 'cflags': ['<(pgo_use)'],
                 'ldflags': ['<(pgo_use)'],
+              },],
+            ],
+          },],
+          ['OS=="win"', {
+            'conditions': [
+              ['enable_lto=="true"', {
+                'msvs_settings': {
+                  'VCCLCompilerTool': {
+                    'AdditionalOptions': ['-flto=full'],
+                  },
+                  'VCLibrarianTool': {
+                    'AdditionalOptions': ['-flto=full'],
+                  },
+                  'VCLinkerTool': {
+                    'AdditionalOptions': ['-flto=full'],
+                  },
+                },
+              },],
+              ['enable_thin_lto=="true"', {
+                'msvs_settings': {
+                  'VCCLCompilerTool': {
+                    'AdditionalOptions': ['-flto=thin'],
+                  },
+                  'VCLibrarianTool': {
+                    'AdditionalOptions': ['-flto=thin'],
+                  },
+                  'VCLinkerTool': {
+                    'AdditionalOptions': ['-flto=thin'],
+                  },
+                },
+              },],
+              ['(enable_thin_lto=="true" or enable_lto=="true") and lto_jobs!=""', {
+                'msvs_settings': {
+                  'VCLinkerTool': {
+                    'AdditionalOptions': ['/opt:lldltojobs=<(lto_jobs)'],
+                  },
+                },
+              },],
+            ],
+            'target_conditions': [
+              ['_toolset=="target"', {
+                'conditions': [
+                  ['enable_pgo_generate=="true"', {
+                    'msvs_settings': {
+                      'VCCLCompilerTool': {
+                        'AdditionalOptions': ['-fprofile-generate'],
+                      },
+                      'VCLinkerTool': {
+                        'AdditionalOptions': [
+                          '/NODEFAULTLIB:clang_rt.profile.lib',
+                          '"<(clang_profile_lib)"',
+                        ],
+                      },
+                    },
+                  },],
+                  ['enable_pgo_use=="true"', {
+                    'msvs_settings': {
+                      'VCCLCompilerTool': {
+                        'AdditionalOptions': ['-fprofile-use=$(SolutionDir)node.profdata'],
+                      },
+                      'VCLinkerTool': {
+                        'AdditionalOptions': ['-fprofile-use=$(SolutionDir)node.profdata'],
+                      },
+                    },
+                  },],
+                ],
               },],
             ],
           },],
@@ -274,6 +347,9 @@
     # Defines these mostly for node-gyp to pickup.
     'defines': [
       '_GLIBCXX_USE_CXX11_ABI=1',
+      # This help forks when building Node.js on a 32-bit arch as
+      # libuv is always compiled with _FILE_OFFSET_BITS=64
+      '_FILE_OFFSET_BITS=64'
     ],
 
     # Forcibly disable -Werror.  We support a wide range of compilers, it's
@@ -309,6 +385,11 @@
               '/Zm2000',
             ],
           }],
+          ['control_flow_guard=="true"', {
+            'AdditionalOptions': [
+              '/guard:cf',                        # Control Flow Guard
+            ],
+          }],
         ],
         'BufferSecurityCheck': 'true',
         'DebugInformationFormat': 1,          # /Z7 embed info in .obj files
@@ -334,6 +415,11 @@
           }],
           ['target_arch=="arm64"', {
             'TargetMachine' : 0,              # NotSet. MACHINE:ARM64 is inferred from the input files.
+          }],
+          ['control_flow_guard=="true"', {
+            'AdditionalOptions': [
+              '/guard:cf',                        # Control Flow Guard
+            ],
           }],
         ],
         'GenerateDebugInformation': 'true',
@@ -422,26 +508,29 @@
       }],
       # The defines bellow must include all things from the external_v8_defines
       # list in v8/BUILD.gn.
+      ['node_enable_experimentals == "true"', {
+        'defines': ['EXPERIMENTALS_DEFAULT_VALUE=true'],
+      }],
       ['v8_enable_v8_checks == 1', {
         'defines': ['V8_ENABLE_CHECKS'],
       }],
       ['v8_enable_pointer_compression == 1', {
         'defines': ['V8_COMPRESS_POINTERS'],
       }],
+      ['v8_enable_pointer_compression == 1 and v8_enable_pointer_compression_shared_cage != 1', {
+        'defines': ['V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES'],
+      }],
       ['v8_enable_pointer_compression_shared_cage == 1', {
         'defines': ['V8_COMPRESS_POINTERS_IN_SHARED_CAGE'],
-      }],
-      ['v8_enable_pointer_compression == 1 and v8_enable_pointer_compression_shared_cage != 1', {
-        'defines': ['V8_COMPRESS_POINTERS_IN_ISOLATE_CAGE'],
       }],
       ['v8_enable_pointer_compression == 1 or v8_enable_31bit_smis_on_64bit_arch == 1', {
         'defines': ['V8_31BIT_SMIS_ON_64BIT_ARCH'],
       }],
-      ['v8_enable_zone_compression == 1', {
-        'defines': ['V8_COMPRESS_ZONES',],
-      }],
       ['v8_enable_sandbox == 1', {
         'defines': ['V8_ENABLE_SANDBOX',],
+      }],
+      ['v8_enable_external_code_space == 1', {
+        'defines': ['V8_EXTERNAL_CODE_SPACE',],
       }],
       ['v8_deprecation_warnings == 1', {
         'defines': ['V8_DEPRECATION_WARNINGS',],
@@ -457,12 +546,6 @@
       }],
       ['tsan == 1', {
         'defines': ['V8_IS_TSAN',],
-      }],
-      ['v8_enable_conservative_stack_scanning == 1', {
-        'defines': ['V8_ENABLE_CONSERVATIVE_STACK_SCANNING',],
-      }],
-      ['v8_enable_direct_local == 1', {
-        'defines': ['V8_ENABLE_DIRECT_LOCAL',],
       }],
       ['OS == "win"', {
         'defines': [
@@ -483,11 +566,11 @@
           'NOMINMAX',
         ],
       }],
-      [ 'OS in "linux freebsd openbsd solaris aix os400"', {
+      [ 'OS in "linux freebsd openbsd solaris aix os400 openharmony"', {
         'cflags': [ '-pthread' ],
         'ldflags': [ '-pthread' ],
       }],
-      [ 'OS in "linux freebsd openbsd solaris android aix os400 cloudabi"', {
+      [ 'OS in "linux freebsd openbsd solaris android aix os400 cloudabi openharmony"', {
         'cflags': [ '-Wall', '-Wextra', '-Wno-unused-parameter', ],
         'cflags_cc': [
           '-fno-rtti',
@@ -516,17 +599,22 @@
                 'cflags': [ '-m64' ],
                 'ldflags': [ '-m64' ],
               }],
-              [ 'host_arch=="ppc" and OS not in "aix os400"', {
-                'cflags': [ '-m32' ],
-                'ldflags': [ '-m32' ],
-              }],
               [ 'host_arch=="ppc64" and OS not in "aix os400"', {
-                'cflags': [ '-m64', '-mminimal-toc' ],
-                'ldflags': [ '-m64' ],
+                'conditions': [
+                  [ 'clang==0', {
+                    'cflags': [ '-mminimal-toc' ],
+                  }],
+                ],
+                'cflags': [ '-m64', '-mcpu=power9' ],
+                'ldflags': [ '-m64', '-mcpu=power9' ],
               }],
               [ 'host_arch=="s390x" and OS=="linux"', {
-                'cflags': [ '-m64', '-march=z196' ],
-                'ldflags': [ '-m64', '-march=z196' ],
+                'cflags': [ '-m64', '-march=z14' ],
+                'ldflags': [ '-m64', '-march=z14' ],
+              }],
+              [ 'host_arch=="riscv64" and OS=="linux"', {
+                'cflags': [ '-march=rv64gc' ],
+                'ldflags': [ '-march=rv64gc' ],
               }],
             ],
           }],
@@ -540,17 +628,22 @@
                 'cflags': [ '-m64' ],
                 'ldflags': [ '-m64' ],
               }],
-              [ 'target_arch=="ppc" and OS not in "aix os400"', {
-                'cflags': [ '-m32' ],
-                'ldflags': [ '-m32' ],
-              }],
               [ 'target_arch=="ppc64" and OS not in "aix os400"', {
-                'cflags': [ '-m64', '-mminimal-toc' ],
-                'ldflags': [ '-m64' ],
+                'conditions': [
+                  [ 'clang==0', {
+                    'cflags': [ '-mminimal-toc' ],
+                  }],
+                ],
+                'cflags': [ '-m64', '-mcpu=power9' ],
+                'ldflags': [ '-m64', '-mcpu=power9' ],
               }],
               [ 'target_arch=="s390x" and OS=="linux"', {
-                'cflags': [ '-m64', '-march=z196' ],
-                'ldflags': [ '-m64', '-march=z196' ],
+                'cflags': [ '-m64', '-march=z14' ],
+                'ldflags': [ '-m64', '-march=z14' ],
+              }],
+              [ 'target_arch=="riscv64" and OS=="linux"', {
+                'cflags': [ '-march=rv64gc' ],
+                'ldflags': [ '-march=rv64gc' ],
               }],
             ],
           }],
@@ -562,8 +655,11 @@
             'cflags!': [ '-pthread' ],
             'ldflags!': [ '-pthread' ],
           }],
-          [ 'node_shared=="true"', {
+          # The V8 static libraries get linked into libv8_debug_helper, so they
+          # have to be position independent too.
+          [ 'node_shared=="true" or node_enable_v8debughelper=="true"', {
             'cflags': [ '-fPIC' ],
+            'ldflags': [ '-fPIC' ],
           }],
         ],
       }],
@@ -579,6 +675,18 @@
           '-maix64',
         ],
         'conditions': [
+          [ 'clang==1', {
+            'cflags': [
+              '-fno-integrated-as',
+              '-fno-xl-pragma-pack',
+              '-mcpu=power9',
+            ],
+            'cflags_cc': [
+              '-fno-integrated-as',
+              '-fno-xl-pragma-pack',
+              '-mcpu=power9',
+            ],
+          }],
           [ '"<(aix_variant_name)"=="OS400"', {            # a.k.a. `IBM i`
             'ldflags': [
               '-Wl,-blibpath:/QOpenSys/pkgs/lib:/QOpenSys/usr/lib',
@@ -586,7 +694,7 @@
             ],
           }, {                                             # else it's `AIX`
             'variables': {
-              'gcc_major': '<!(<(python) -c "import os; import subprocess; CXX=os.environ.get(\'CXX\', \'g++\'); subprocess.run([CXX, \'-dumpversion\'])")'
+              'gcc_major': '<!(sh -c "${CXX:-g++} -dumpversion")'
             },
             # Disable the following compiler warning:
             #
@@ -627,7 +735,7 @@
           'GCC_ENABLE_PASCAL_STRINGS': 'NO',        # No -mpascal-strings
           'GCC_STRICT_ALIASING': 'NO',              # -fno-strict-aliasing
           'PREBINDING': 'NO',                       # No -Wl,-prebind
-          'MACOSX_DEPLOYMENT_TARGET': '11.0',       # -mmacosx-version-min=11.0
+          'MACOSX_DEPLOYMENT_TARGET': '13.5',       # -mmacosx-version-min=13.5
           'USE_HEADERMAP': 'NO',
           'WARNING_CFLAGS': [
             '-Wall',

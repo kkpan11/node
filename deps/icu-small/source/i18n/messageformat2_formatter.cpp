@@ -3,6 +3,8 @@
 
 #include "unicode/utypes.h"
 
+#if !UCONFIG_NO_NORMALIZATION
+
 #if !UCONFIG_NO_FORMATTING
 
 #if !UCONFIG_NO_MF2
@@ -27,11 +29,31 @@ namespace message2 {
     // -------------------------------------
     // Creates a MessageFormat instance based on the pattern.
 
-    MessageFormatter::Builder& MessageFormatter::Builder::setPattern(const UnicodeString& pat, UParseError& parseError, UErrorCode& errorCode) {
+    void MessageFormatter::Builder::clearState() {
         normalizedInput.remove();
+        delete errors;
+        errors = nullptr;
+    }
+
+    MessageFormatter::Builder& MessageFormatter::Builder::setPattern(const UnicodeString& pat,
+                                                                     UParseError& parseError,
+                                                                     UErrorCode& errorCode) {
+        clearState();
+        // Create errors
+        errors = create<StaticErrors>(StaticErrors(errorCode), errorCode);
+        THIS_ON_ERROR(errorCode);
+
         // Parse the pattern
         MFDataModel::Builder tree(errorCode);
-        Parser(pat, tree, *errors, normalizedInput).parse(parseError, errorCode);
+        Parser(pat, tree, *errors, normalizedInput, errorCode)
+            .parse(parseError, errorCode);
+
+        // Fail on syntax errors
+        if (errors->hasSyntaxError()) {
+            errors->checkErrors(errorCode);
+            // Check that the checkErrors() method set the error code
+            U_ASSERT(U_FAILURE(errorCode));
+        }
 
         // Build the data model based on what was parsed
         dataModel = tree.build(errorCode);
@@ -55,14 +77,19 @@ namespace message2 {
     }
 
     MessageFormatter::Builder& MessageFormatter::Builder::setDataModel(MFDataModel&& newDataModel) {
-        normalizedInput.remove();
-        delete errors;
-        errors = nullptr;
+        clearState();
         hasPattern = false;
         hasDataModel = true;
         dataModel = std::move(newDataModel);
 
         return *this;
+    }
+
+    MessageFormatter::Builder&
+        MessageFormatter::Builder::setErrorHandlingBehavior(
+           MessageFormatter::UMFErrorHandlingBehavior type) {
+               signalErrors = type == U_MF_STRICT;
+               return *this;
     }
 
     /*
@@ -86,6 +113,7 @@ namespace message2 {
     MessageFormatter::Builder::~Builder() {
         if (errors != nullptr) {
             delete errors;
+            errors = nullptr;
         }
     }
 
@@ -102,20 +130,25 @@ namespace message2 {
         FormatterFactory* time = StandardFunctions::DateTimeFactory::time(success);
         FormatterFactory* number = new StandardFunctions::NumberFactory();
         FormatterFactory* integer = new StandardFunctions::IntegerFactory();
-        standardFunctionsBuilder.adoptFormatter(FunctionName(UnicodeString("datetime")), dateTime, success)
-            .adoptFormatter(FunctionName(UnicodeString("date")), date, success)
-            .adoptFormatter(FunctionName(UnicodeString("time")), time, success)
-            .adoptFormatter(FunctionName(UnicodeString("number")), number, success)
-            .adoptFormatter(FunctionName(UnicodeString("integer")), integer, success)
-            .adoptSelector(FunctionName(UnicodeString("number")), new StandardFunctions::PluralFactory(UPLURAL_TYPE_CARDINAL), success)
-            .adoptSelector(FunctionName(UnicodeString("integer")), new StandardFunctions::PluralFactory(StandardFunctions::PluralFactory::integer()), success)
-            .adoptSelector(FunctionName(UnicodeString("string")), new StandardFunctions::TextFactory(), success);
+        standardFunctionsBuilder.adoptFormatter(FunctionName(functions::DATETIME), dateTime, success)
+            .adoptFormatter(FunctionName(functions::DATE), date, success)
+            .adoptFormatter(FunctionName(functions::TIME), time, success)
+            .adoptFormatter(FunctionName(functions::NUMBER), number, success)
+            .adoptFormatter(FunctionName(functions::INTEGER), integer, success)
+            .adoptFormatter(FunctionName(functions::TEST_FUNCTION), new StandardFunctions::TestFormatFactory(), success)
+            .adoptFormatter(FunctionName(functions::TEST_FORMAT), new StandardFunctions::TestFormatFactory(), success)
+            .adoptSelector(FunctionName(functions::NUMBER), new StandardFunctions::PluralFactory(UPLURAL_TYPE_CARDINAL), success)
+            .adoptSelector(FunctionName(functions::INTEGER), new StandardFunctions::PluralFactory(StandardFunctions::PluralFactory::integer()), success)
+            .adoptSelector(FunctionName(functions::STRING), new StandardFunctions::TextFactory(), success)
+            .adoptSelector(FunctionName(functions::TEST_FUNCTION), new StandardFunctions::TestSelectFactory(), success)
+            .adoptSelector(FunctionName(functions::TEST_SELECT), new StandardFunctions::TestSelectFactory(), success);
         CHECK_ERROR(success);
         standardMFFunctionRegistry = standardFunctionsBuilder.build();
         CHECK_ERROR(success);
         standardMFFunctionRegistry.checkStandard();
 
         normalizedInput = builder.normalizedInput;
+        signalErrors = builder.signalErrors;
 
         // Build data model
         // First, check that there is a data model
@@ -144,12 +177,13 @@ namespace message2 {
         // only be checked when arguments are known)
 
         // Check for resolution errors
-        Checker(dataModel, *errors).check(success);
+        Checker(dataModel, *errors, *this).check(success);
     }
 
     void MessageFormatter::cleanup() noexcept {
         if (errors != nullptr) {
             delete errors;
+            errors = nullptr;
         }
     }
 
@@ -161,6 +195,7 @@ namespace message2 {
         customMFFunctionRegistry = other.customMFFunctionRegistry;
         dataModel = std::move(other.dataModel);
         normalizedInput = std::move(other.normalizedInput);
+        signalErrors = other.signalErrors;
         errors = other.errors;
         other.errors = nullptr;
         return *this;
@@ -228,8 +263,11 @@ namespace message2 {
         return formatter;
     }
 
-    bool MessageFormatter::getDefaultFormatterNameByType(const UnicodeString& type, FunctionName& name) const {
-        U_ASSERT(hasCustomMFFunctionRegistry());
+    bool MessageFormatter::getDefaultFormatterNameByType(const UnicodeString& type,
+                                                         FunctionName& name) const {
+        if (!hasCustomMFFunctionRegistry()) {
+            return false;
+        }
         const MFFunctionRegistry& reg = getCustomMFFunctionRegistry();
         return reg.getDefaultFormatterNameByType(type, name);
     }
@@ -324,3 +362,5 @@ U_NAMESPACE_END
 #endif /* #if !UCONFIG_NO_MF2 */
 
 #endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */

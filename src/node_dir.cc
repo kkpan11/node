@@ -42,6 +42,7 @@ using v8::Null;
 using v8::Number;
 using v8::Object;
 using v8::ObjectTemplate;
+using v8::TryCatch;
 using v8::Value;
 
 static const char* get_dir_func_name_by_type(uv_fs_type req_type) {
@@ -62,16 +63,10 @@ static const char* get_dir_func_name_by_type(uv_fs_type req_type) {
 #define GET_TRACE_ENABLED                                                      \
   (*TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(                                \
        TRACING_CATEGORY_NODE2(fs_dir, sync)) != 0)
-#define FS_DIR_SYNC_TRACE_BEGIN(syscall, ...)                                  \
-  if (GET_TRACE_ENABLED)                                                       \
-    TRACE_EVENT_BEGIN(TRACING_CATEGORY_NODE2(fs_dir, sync),                    \
-                      TRACE_NAME(syscall),                                     \
-                      ##__VA_ARGS__);
-#define FS_DIR_SYNC_TRACE_END(syscall, ...)                                    \
-  if (GET_TRACE_ENABLED)                                                       \
-    TRACE_EVENT_END(TRACING_CATEGORY_NODE2(fs_dir, sync),                      \
-                    TRACE_NAME(syscall),                                       \
-                    ##__VA_ARGS__);
+#define FS_DIR_SYNC_TRACE(syscall)                                             \
+  if (GET_TRACE_ENABLED) {                                                     \
+    TRACE_EVENT0(TRACING_CATEGORY_NODE2(fs_dir, sync), TRACE_NAME(syscall));   \
+  }
 
 #define FS_DIR_ASYNC_TRACE_BEGIN0(fs_type, id)                                 \
   TRACE_EVENT_NESTABLE_ASYNC_BEGIN0(TRACING_CATEGORY_NODE2(fs_dir, async),     \
@@ -137,9 +132,11 @@ void DirHandle::MemoryInfo(MemoryTracker* tracker) const {
 inline void DirHandle::GCClose() {
   if (closed_) return;
   uv_fs_t req;
-  FS_DIR_SYNC_TRACE_BEGIN(closedir);
-  int ret = uv_fs_closedir(nullptr, &req, dir_, nullptr);
-  FS_DIR_SYNC_TRACE_END(closedir);
+  int ret;
+  {
+    FS_DIR_SYNC_TRACE(closedir);
+    ret = uv_fs_closedir(nullptr, &req, dir_, nullptr);
+  }
   uv_fs_req_cleanup(&req);
   closing_ = false;
   closed_ = true;
@@ -200,40 +197,33 @@ void DirHandle::Close(const FunctionCallbackInfo<Value>& args) {
               uv_fs_closedir, dir->dir());
   } else {  // close()
     FSReqWrapSync req_wrap_sync("closedir");
-    FS_DIR_SYNC_TRACE_BEGIN(closedir);
+    FS_DIR_SYNC_TRACE(closedir);
     SyncCallAndThrowOnError(env, &req_wrap_sync, uv_fs_closedir, dir->dir());
-    FS_DIR_SYNC_TRACE_END(closedir);
   }
 }
 
-static MaybeLocal<Array> DirentListToArray(
-    Environment* env,
-    uv_dirent_t* ents,
-    int num,
-    enum encoding encoding,
-    Local<Value>* err_out) {
-  MaybeStackBuffer<Local<Value>, 64> entries(num * 2);
+static MaybeLocal<Array> DirentListToArray(Environment* env,
+                                           uv_dirent_t* ents,
+                                           int num,
+                                           enum encoding encoding) {
+  MaybeStackBuffer<Value, 64> entries(env->isolate(), num * 2);
 
   // Return an array of all read filenames.
   int j = 0;
   for (int i = 0; i < num; i++) {
     Local<Value> filename;
-    Local<Value> error;
     const size_t namelen = strlen(ents[i].name);
-    if (!StringBytes::Encode(env->isolate(),
-                             ents[i].name,
-                             namelen,
-                             encoding,
-                             &error).ToLocal(&filename)) {
-      *err_out = error;
-      return MaybeLocal<Array>();
+    if (!StringBytes::Encode(env->isolate(), ents[i].name, namelen, encoding)
+             .ToLocal(&filename)) {
+      return {};
     }
 
     entries[j++] = filename;
     entries[j++] = Integer::New(env->isolate(), ents[i].type);
   }
 
-  return Array::New(env->isolate(), entries.out(), j);
+  CHECK_EQ(j, num * 2);
+  return entries.ToArray();
 }
 
 static void AfterDirRead(uv_fs_t* req) {
@@ -258,18 +248,18 @@ static void AfterDirRead(uv_fs_t* req) {
 
   uv_dir_t* dir = static_cast<uv_dir_t*>(req->ptr);
 
-  Local<Value> error;
+  TryCatch try_catch(isolate);
   Local<Array> js_array;
   if (!DirentListToArray(env,
                          dir->dirents,
                          static_cast<int>(req->result),
-                         req_wrap->encoding(),
-                         &error)
+                         req_wrap->encoding())
            .ToLocal(&js_array)) {
     // Clear libuv resources *before* delivering results to JS land because
     // that can schedule another operation on the same uv_dir_t. Ditto below.
     after.Clear();
-    return req_wrap->Reject(error);
+    CHECK(try_catch.CanContinue());
+    return req_wrap->Reject(try_catch.Exception());
   }
 
   after.Clear();
@@ -305,10 +295,12 @@ void DirHandle::Read(const FunctionCallbackInfo<Value>& args) {
               AfterDirRead, uv_fs_readdir, dir->dir());
   } else {  // dir.read(encoding, bufferSize)
     FSReqWrapSync req_wrap_sync("readdir");
-    FS_DIR_SYNC_TRACE_BEGIN(readdir);
-    int err =
-        SyncCallAndThrowOnError(env, &req_wrap_sync, uv_fs_readdir, dir->dir());
-    FS_DIR_SYNC_TRACE_END(readdir);
+    int err;
+    {
+      FS_DIR_SYNC_TRACE(readdir);
+      err = SyncCallAndThrowOnError(
+          env, &req_wrap_sync, uv_fs_readdir, dir->dir());
+    }
     if (err < 0) {
       return;  // syscall failed, no need to continue, error is already thrown
     }
@@ -320,16 +312,16 @@ void DirHandle::Read(const FunctionCallbackInfo<Value>& args) {
 
     CHECK_GE(req_wrap_sync.req.result, 0);
 
-    Local<Value> error;
+    TryCatch try_catch(isolate);
     Local<Array> js_array;
     if (!DirentListToArray(env,
                            dir->dir()->dirents,
                            static_cast<int>(req_wrap_sync.req.result),
-                           encoding,
-                           &error)
+                           encoding)
              .ToLocal(&js_array)) {
       // TODO(anonrig): Initializing BufferValue here is wasteful.
-      BufferValue error_payload(isolate, error);
+      CHECK(try_catch.CanContinue());
+      BufferValue error_payload(isolate, try_catch.Exception());
       env->ThrowError(error_payload.out());
       return;
     }
@@ -383,10 +375,12 @@ static void OpenDir(const FunctionCallbackInfo<Value>& args) {
     THROW_IF_INSUFFICIENT_PERMISSIONS(
         env, permission::PermissionScope::kFileSystemRead, path.ToStringView());
     FSReqWrapSync req_wrap_sync("opendir", *path);
-    FS_DIR_SYNC_TRACE_BEGIN(opendir);
-    int result =
-        SyncCallAndThrowOnError(env, &req_wrap_sync, uv_fs_opendir, *path);
-    FS_DIR_SYNC_TRACE_END(opendir);
+    int result;
+    {
+      FS_DIR_SYNC_TRACE(opendir);
+      result =
+          SyncCallAndThrowOnError(env, &req_wrap_sync, uv_fs_opendir, *path);
+    }
     if (result < 0) {
       return;  // syscall failed, no need to continue, error is already thrown
     }
@@ -413,9 +407,11 @@ static void OpenDirSync(const FunctionCallbackInfo<Value>& args) {
 
   uv_fs_t req;
   auto make = OnScopeLeave([&req]() { uv_fs_req_cleanup(&req); });
-  FS_DIR_SYNC_TRACE_BEGIN(opendir);
-  int err = uv_fs_opendir(nullptr, &req, *path, nullptr);
-  FS_DIR_SYNC_TRACE_END(opendir);
+  int err;
+  {
+    FS_DIR_SYNC_TRACE(opendir);
+    err = uv_fs_opendir(nullptr, &req, *path, nullptr);
+  }
   if (err < 0) {
     return env->ThrowUVException(err, "opendir");
   }

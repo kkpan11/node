@@ -1,4 +1,6 @@
 #include "base_object-inl.h"
+#include "inspector/network_resource_manager.h"
+#include "inspector/protocol_helper.h"
 #include "inspector_agent.h"
 #include "inspector_io.h"
 #include "memory_tracker-inl.h"
@@ -8,6 +10,9 @@
 #include "v8.h"
 
 #include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace node {
 namespace inspector {
@@ -17,25 +22,18 @@ using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
+using v8::GCCallbackFlags;
+using v8::GCType;
 using v8::Global;
 using v8::HandleScope;
 using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
-using v8::NewStringType;
 using v8::Object;
 using v8::String;
 using v8::Uint32;
 using v8::Value;
-
-using v8_inspector::StringBuffer;
 using v8_inspector::StringView;
-
-std::unique_ptr<StringBuffer> ToProtocolString(Isolate* isolate,
-                                               Local<Value> value) {
-  TwoByteValue buffer(isolate, value);
-  return StringBuffer::create(StringView(*buffer, buffer.length()));
-}
 
 struct LocalConnection {
   static std::unique_ptr<InspectorSession> Connect(
@@ -72,14 +70,7 @@ class JSBindingsConnection : public BaseObject {
 
     void SendMessageToFrontend(const v8_inspector::StringView& message)
         override {
-      Isolate* isolate = env_->isolate();
-      HandleScope handle_scope(isolate);
-      Context::Scope context_scope(env_->context());
-      Local<Value> argument;
-      if (!String::NewFromTwoByte(isolate, message.characters16(),
-                                  NewStringType::kNormal,
-                                  message.length()).ToLocal(&argument)) return;
-      connection_->OnMessage(argument);
+      connection_->SendMessageToFrontend(message);
     }
 
    private:
@@ -94,12 +85,86 @@ class JSBindingsConnection : public BaseObject {
     Agent* inspector = env->inspector_agent();
     session_ = ConnectionType::Connect(
         inspector, std::make_unique<JSBindingsSessionDelegate>(env, this));
+    // Inspector responses may be produced from a GC weak callback, where
+    // invoking the JavaScript session callback is forbidden. Defer delivery
+    // until the GC has completed.
+    env->isolate()->AddGCPrologueCallback(GCPrologueCallback, this);
+    env->isolate()->AddGCEpilogueCallback(GCEpilogueCallback, this);
+  }
+
+  ~JSBindingsConnection() override {
+    env()->isolate()->RemoveGCPrologueCallback(GCPrologueCallback, this);
+    env()->isolate()->RemoveGCEpilogueCallback(GCEpilogueCallback, this);
+  }
+
+  void SendMessageToFrontend(const v8_inspector::StringView& message) {
+    if (in_gc_ || delivering_ || !pending_messages_.empty()) {
+      pending_messages_.emplace_back(
+          message.is8Bit()
+              ? std::u16string(message.characters8(),
+                               message.characters8() + message.length())
+              : std::u16string(message.characters16(),
+                               message.characters16() + message.length()));
+      ScheduleFlush();
+      return;
+    }
+    Isolate* isolate = env()->isolate();
+    HandleScope handle_scope(isolate);
+    Context::Scope context_scope(env()->context());
+    Local<Value> argument;
+    if (!ToV8Value(env()->context(), message, isolate).ToLocal(&argument))
+      return;
+    OnMessage(argument);
   }
 
   void OnMessage(Local<Value> value) {
     auto result = callback_.Get(env()->isolate())
                       ->Call(env()->context(), object(), 1, &value);
     (void)result;
+  }
+
+  void ScheduleFlush() {
+    if (flush_scheduled_ || delivering_) return;
+    flush_scheduled_ = true;
+    BaseObjectPtr<JSBindingsConnection> strong_ref{this};
+    env()->SetImmediate(
+        [strong_ref](Environment*) { strong_ref->FlushPendingMessages(); },
+        CallbackFlags::kUnrefed);
+  }
+
+  void FlushPendingMessages() {
+    flush_scheduled_ = false;
+    if (pending_messages_.empty()) return;
+    Isolate* isolate = env()->isolate();
+    HandleScope handle_scope(isolate);
+    Context::Scope context_scope(env()->context());
+    delivering_ = true;
+    while (!pending_messages_.empty()) {
+      std::u16string message = std::move(pending_messages_.front());
+      pending_messages_.erase(pending_messages_.begin());
+      Local<Value> argument;
+      if (ToV8Value(env()->context(), std::u16string_view(message), isolate)
+              .ToLocal(&argument)) {
+        OnMessage(argument);
+      }
+    }
+    delivering_ = false;
+  }
+
+  static void GCPrologueCallback(Isolate*,
+                                 GCType,
+                                 GCCallbackFlags,
+                                 void* data) {
+    static_cast<JSBindingsConnection*>(data)->in_gc_ = true;
+  }
+
+  static void GCEpilogueCallback(Isolate*,
+                                 GCType,
+                                 GCCallbackFlags,
+                                 void* data) {
+    auto* connection = static_cast<JSBindingsConnection*>(data);
+    connection->in_gc_ = false;
+    if (!connection->pending_messages_.empty()) connection->ScheduleFlush();
   }
 
   static void Bind(Environment* env, Local<Object> target) {
@@ -136,14 +201,13 @@ class JSBindingsConnection : public BaseObject {
   }
 
   static void Dispatch(const FunctionCallbackInfo<Value>& info) {
-    Environment* env = Environment::GetCurrent(info);
     JSBindingsConnection* session;
     ASSIGN_OR_RETURN_UNWRAP(&session, info.This());
     CHECK(info[0]->IsString());
 
     if (session->session_) {
       session->session_->Dispatch(
-          ToProtocolString(env->isolate(), info[0])->string());
+          ToInspectorString(info.GetIsolate(), info[0])->string());
     }
   }
 
@@ -163,6 +227,10 @@ class JSBindingsConnection : public BaseObject {
  private:
   std::unique_ptr<InspectorSession> session_;
   Global<Function> callback_;
+  std::vector<std::u16string> pending_messages_;
+  bool in_gc_ = false;
+  bool delivering_ = false;
+  bool flush_scheduled_ = false;
 };
 
 static bool InspectorEnabled(Environment* env) {
@@ -188,11 +256,12 @@ void CallAndPauseOnStart(const FunctionCallbackInfo<v8::Value>& args) {
   CHECK(args[0]->IsFunction());
   SlicedArguments call_args(args, /* start */ 2);
   env->inspector_agent()->PauseOnNextJavascriptStatement("Break on start");
-  v8::MaybeLocal<v8::Value> retval =
-      args[0].As<v8::Function>()->Call(env->context(), args[1],
-                                       call_args.length(), call_args.out());
-  if (!retval.IsEmpty()) {
-    args.GetReturnValue().Set(retval.ToLocalChecked());
+  Local<Value> ret;
+  if (args[0]
+          .As<v8::Function>()
+          ->Call(env->context(), args[1], call_args.length(), call_args.out())
+          .ToLocal(&ret)) {
+    args.GetReturnValue().Set(ret);
   }
 }
 
@@ -237,8 +306,10 @@ template <void (Agent::*asyncTaskFn)(void*)>
 static void InvokeAsyncTaskFnWithId(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   CHECK(args[0]->IsNumber());
-  int64_t task_id = args[0]->IntegerValue(env->context()).FromJust();
-  (env->inspector_agent()->*asyncTaskFn)(GetAsyncTask(task_id));
+  int64_t task_id;
+  if (args[0]->IntegerValue(env->context()).To(&task_id)) {
+    (env->inspector_agent()->*asyncTaskFn)(GetAsyncTask(task_id));
+  }
 }
 
 static void AsyncTaskScheduledWrapper(const FunctionCallbackInfo<Value>& args) {
@@ -246,11 +317,14 @@ static void AsyncTaskScheduledWrapper(const FunctionCallbackInfo<Value>& args) {
 
   CHECK(args[0]->IsString());
   Local<String> task_name = args[0].As<String>();
-  String::Value task_name_value(args.GetIsolate(), task_name);
-  StringView task_name_view(*task_name_value, task_name_value.length());
+  TwoByteValue task_name_value(args.GetIsolate(), task_name);
+  StringView task_name_view(task_name_value.out(), task_name_value.length());
 
   CHECK(args[1]->IsNumber());
-  int64_t task_id = args[1]->IntegerValue(env->context()).FromJust();
+  int64_t task_id;
+  if (!args[1]->IntegerValue(env->context()).To(&task_id)) {
+    return;
+  }
   void* task = GetAsyncTask(task_id);
 
   CHECK(args[2]->IsBoolean());
@@ -274,12 +348,13 @@ void EmitProtocolEvent(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   CHECK(args[0]->IsString());
   Local<String> eventName = args[0].As<String>();
-  CHECK(args[1]->IsString());
-  Local<String> params = args[1].As<String>();
+  CHECK(args[1]->IsObject());
+  Local<Object> params = args[1].As<Object>();
 
   env->inspector_agent()->EmitProtocolEvent(
-      ToProtocolString(env->isolate(), eventName)->string(),
-      ToProtocolString(env->isolate(), params)->string());
+      args.GetIsolate()->GetCurrentContext(),
+      ToInspectorString(env->isolate(), eventName)->string(),
+      params);
 }
 
 void SetupNetworkTracking(const FunctionCallbackInfo<Value>& args) {
@@ -333,7 +408,19 @@ void Url(const FunctionCallbackInfo<Value>& args) {
   if (url.empty()) {
     return;
   }
-  args.GetReturnValue().Set(OneByteString(env->isolate(), url.c_str()));
+  args.GetReturnValue().Set(OneByteString(env->isolate(), url));
+}
+
+void PutNetworkResource(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  CHECK_GE(args.Length(), 2);
+  CHECK(args[0]->IsString());
+  CHECK(args[1]->IsString());
+
+  Utf8Value url(env->isolate(), args[0].As<String>());
+  Utf8Value data(env->isolate(), args[1].As<String>());
+
+  env->inspector_agent()->GetNetworkResourceManager()->Put(*url, *data);
 }
 
 void Initialize(Local<Object> target, Local<Value> unused,
@@ -380,6 +467,7 @@ void Initialize(Local<Object> target, Local<Value> unused,
   SetMethodNoSideEffect(context, target, "isEnabled", IsEnabled);
   SetMethod(context, target, "emitProtocolEvent", EmitProtocolEvent);
   SetMethod(context, target, "setupNetworkTracking", SetupNetworkTracking);
+  SetMethod(context, target, "putNetworkResource", PutNetworkResource);
 
   Local<String> console_string = FIXED_ONE_BYTE_STRING(isolate, "console");
 
@@ -422,6 +510,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(JSBindingsConnection<MainThreadConnection>::New);
   registry->Register(JSBindingsConnection<MainThreadConnection>::Dispatch);
   registry->Register(JSBindingsConnection<MainThreadConnection>::Disconnect);
+  registry->Register(PutNetworkResource);
 }
 
 }  // namespace inspector

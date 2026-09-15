@@ -305,6 +305,7 @@ audited 1 package in xxx
 1 package has a verified registry signature
 
 1 package has a verified attestation
+(use --json --include-attestations to view attestation details)
 `
 
 exports[`test/lib/commands/audit.js TAP audit signatures with valid signatures > must match snapshot 1`] = `
@@ -329,21 +330,6 @@ exports[`test/lib/commands/audit.js TAP audit signatures workspaces verifies reg
 audited 2 packages in xxx
 
 2 packages have verified registry signatures
-`
-
-exports[`test/lib/commands/audit.js TAP fallback audit > must match snapshot 1`] = `
-# npm audit report
-
-test-dep-a  1.0.0
-Severity: high
-Test advisory 100 - https://github.com/advisories/GHSA-100
-fix available via \`npm audit fix\`
-node_modules/test-dep-a
-
-1 high severity vulnerability
-
-To address all issues, run:
-  npm audit fix
 `
 
 exports[`test/lib/commands/audit.js TAP json audit > must match snapshot 1`] = `

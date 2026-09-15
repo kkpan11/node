@@ -8,6 +8,7 @@
 #include "v8.h"
 
 using node::BufferValue;
+using node::NormalizeFileURLOrPath;
 using node::PathResolve;
 using node::ToNamespacedPath;
 
@@ -25,14 +26,16 @@ TEST_F(PathTest, PathResolve) {
             "d:\\e.exe");
   EXPECT_EQ(PathResolve(*env, {"c:/ignore", "c:/some/file"}), "c:\\some\\file");
   EXPECT_EQ(PathResolve(*env, {"d:/ignore", "d:some/dir//"}),
-            "d:\\ignore\\some\\dir\\");
+            "d:\\ignore\\some\\dir");
   EXPECT_EQ(PathResolve(*env, {"."}), cwd);
   EXPECT_EQ(PathResolve(*env, {"//server/share", "..", "relative\\"}),
-            "\\\\server\\share\\relative\\");
+            "\\\\server\\share\\relative");
   EXPECT_EQ(PathResolve(*env, {"c:/", "//"}), "c:\\");
   EXPECT_EQ(PathResolve(*env, {"c:/", "//dir"}), "c:\\dir");
-  EXPECT_EQ(PathResolve(*env, {"c:/", "//server/share"}), "\\\\server\\share");
-  EXPECT_EQ(PathResolve(*env, {"c:/", "//server//share"}), "\\\\server\\share");
+  EXPECT_EQ(PathResolve(*env, {"c:/", "//server/share"}),
+            "\\\\server\\share\\");
+  EXPECT_EQ(PathResolve(*env, {"c:/", "//server//share"}),
+            "\\\\server\\share\\");
   EXPECT_EQ(PathResolve(*env, {"c:/", "///some//dir"}), "c:\\some\\dir");
   EXPECT_EQ(
       PathResolve(*env, {"C:\\foo\\tmp.3\\", "..\\tmp.3\\cycles\\root.js"}),
@@ -42,11 +45,11 @@ TEST_F(PathTest, PathResolve) {
   EXPECT_EQ(PathResolve(*env, {"\\\\?\\PHYSICALDRIVE0"}),
             "\\\\?\\PHYSICALDRIVE0");
 #else
-  EXPECT_EQ(PathResolve(*env, {"/var/lib", "../", "file/"}), "/var/file/");
-  EXPECT_EQ(PathResolve(*env, {"/var/lib", "/../", "file/"}), "/file/");
+  EXPECT_EQ(PathResolve(*env, {"/var/lib", "../", "file/"}), "/var/file");
+  EXPECT_EQ(PathResolve(*env, {"/var/lib", "/../", "file/"}), "/file");
   EXPECT_EQ(PathResolve(*env, {"a/b/c/", "../../.."}), cwd);
   EXPECT_EQ(PathResolve(*env, {"."}), cwd);
-  EXPECT_EQ(PathResolve(*env, {"/some/dir", ".", "/absolute/"}), "/absolute/");
+  EXPECT_EQ(PathResolve(*env, {"/some/dir", ".", "/absolute/"}), "/absolute");
   EXPECT_EQ(PathResolve(*env, {"/foo/tmp.3/", "../tmp.3/cycles/root.js"}),
             "/foo/tmp.3/cycles/root.js");
 #endif
@@ -91,3 +94,26 @@ TEST_F(PathTest, ToNamespacedPath) {
   EXPECT_EQ(data.ToStringView(), "hello world");  // Input should not be mutated
 #endif
 }
+
+#ifdef _WIN32
+TEST_F(PathTest, NormalizeShortFileURLPath) {
+  const v8::HandleScope handle_scope(isolate_);
+  Argv argv;
+  Env env{handle_scope, argv, node::EnvironmentFlags::kNoBrowserGlobals};
+  v8::TryCatch try_catch(isolate_);
+
+  EXPECT_EQ(NormalizeFileURLOrPath(*env, "file:///"), "");
+  ASSERT_TRUE(try_catch.HasCaught());
+
+  v8::Local<v8::Value> exception = try_catch.Exception();
+  ASSERT_TRUE(exception->IsObject());
+  v8::Local<v8::Value> code;
+  ASSERT_TRUE(exception.As<v8::Object>()
+                  ->Get((*env)->context(),
+                        v8::String::NewFromUtf8Literal(isolate_, "code"))
+                  .ToLocal(&code));
+  ASSERT_TRUE(code->IsString());
+  node::Utf8Value code_value(isolate_, code);
+  EXPECT_EQ(code_value.ToStringView(), "ERR_INVALID_FILE_URL_PATH");
+}
+#endif

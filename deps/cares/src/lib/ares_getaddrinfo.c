@@ -58,10 +58,6 @@
 
 #include "ares_dns.h"
 
-#ifdef _WIN32
-#  include "ares_platform.h"
-#endif
-
 struct host_query {
   ares_channel_t            *channel;
   char                      *name;
@@ -101,7 +97,7 @@ static const struct ares_addrinfo_hints default_hints = {
 static ares_bool_t next_dns_lookup(struct host_query *hquery);
 
 struct ares_addrinfo_cname *
-  ares__append_addrinfo_cname(struct ares_addrinfo_cname **head)
+  ares_append_addrinfo_cname(struct ares_addrinfo_cname **head)
 {
   struct ares_addrinfo_cname *tail = ares_malloc_zero(sizeof(*tail));
   struct ares_addrinfo_cname *last = *head;
@@ -123,8 +119,8 @@ struct ares_addrinfo_cname *
   return tail;
 }
 
-void ares__addrinfo_cat_cnames(struct ares_addrinfo_cname **head,
-                               struct ares_addrinfo_cname  *tail)
+void ares_addrinfo_cat_cnames(struct ares_addrinfo_cname **head,
+                              struct ares_addrinfo_cname  *tail)
 {
   struct ares_addrinfo_cname *last = *head;
   if (!last) {
@@ -141,7 +137,7 @@ void ares__addrinfo_cat_cnames(struct ares_addrinfo_cname **head,
 
 /* Allocate new addrinfo and append to the tail. */
 struct ares_addrinfo_node *
-  ares__append_addrinfo_node(struct ares_addrinfo_node **head)
+  ares_append_addrinfo_node(struct ares_addrinfo_node **head)
 {
   struct ares_addrinfo_node *tail = ares_malloc_zero(sizeof(*tail));
   struct ares_addrinfo_node *last = *head;
@@ -163,8 +159,8 @@ struct ares_addrinfo_node *
   return tail;
 }
 
-void ares__addrinfo_cat_nodes(struct ares_addrinfo_node **head,
-                              struct ares_addrinfo_node  *tail)
+void ares_addrinfo_cat_nodes(struct ares_addrinfo_node **head,
+                             struct ares_addrinfo_node  *tail)
 {
   struct ares_addrinfo_node *last = *head;
   if (!last) {
@@ -246,13 +242,18 @@ static ares_bool_t fake_addrinfo(const char *name, unsigned short port,
   ares_status_t               status = ARES_SUCCESS;
   ares_bool_t                 result = ARES_FALSE;
   int                         family = hints->ai_family;
+
+  if (name == NULL) {
+    return ARES_FALSE; /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+
   if (family == AF_INET || family == AF_INET6 || family == AF_UNSPEC) {
     /* It only looks like an IP address if it's all numbers and dots. */
     size_t      numdots = 0;
     ares_bool_t valid   = ARES_TRUE;
     const char *p;
     for (p = name; *p; p++) {
-      if (!ares__isdigit(*p) && *p != '.') {
+      if (!ares_isdigit(*p) && *p != '.') {
         valid = ARES_FALSE;
         break;
       } else if (*p == '.') {
@@ -272,6 +273,7 @@ static ares_bool_t fake_addrinfo(const char *name, unsigned short port,
       if (result) {
         status = ares_append_ai_node(AF_INET, port, 0, &addr4, &ai->nodes);
         if (status != ARES_SUCCESS) {
+          ares_freeaddrinfo(ai);
           callback(arg, (int)status, 0, NULL); /* LCOV_EXCL_LINE: OutOfMemory */
           return ARES_TRUE;                    /* LCOV_EXCL_LINE: OutOfMemory */
         }
@@ -286,6 +288,7 @@ static ares_bool_t fake_addrinfo(const char *name, unsigned short port,
     if (result) {
       status = ares_append_ai_node(AF_INET6, port, 0, &addr6, &ai->nodes);
       if (status != ARES_SUCCESS) {
+        ares_freeaddrinfo(ai);
         callback(arg, (int)status, 0, NULL); /* LCOV_EXCL_LINE: OutOfMemory */
         return ARES_TRUE;                    /* LCOV_EXCL_LINE: OutOfMemory */
       }
@@ -297,7 +300,7 @@ static ares_bool_t fake_addrinfo(const char *name, unsigned short port,
   }
 
   if (hints->ai_flags & ARES_AI_CANONNAME) {
-    cname = ares__append_addrinfo_cname(&ai->cnames);
+    cname = ares_append_addrinfo_cname(&ai->cnames);
     if (!cname) {
       /* LCOV_EXCL_START: OutOfMemory */
       ares_freeaddrinfo(ai);
@@ -327,7 +330,7 @@ static void hquery_free(struct host_query *hquery, ares_bool_t cleanup_ai)
   if (cleanup_ai) {
     ares_freeaddrinfo(hquery->ai);
   }
-  ares__strsplit_free(hquery->names, hquery->names_cnt);
+  ares_strsplit_free(hquery->names, hquery->names_cnt);
   ares_free(hquery->name);
   ares_free(hquery->lookups);
   ares_free(hquery);
@@ -341,7 +344,7 @@ static void end_hquery(struct host_query *hquery, ares_status_t status)
   if (status == ARES_SUCCESS) {
     if (!(hquery->hints.ai_flags & ARES_AI_NOSORT) && hquery->ai->nodes) {
       sentinel.ai_next = hquery->ai->nodes;
-      ares__sortaddrinfo(hquery->channel, &sentinel);
+      ares_sortaddrinfo(hquery->channel, &sentinel);
       hquery->ai->nodes = sentinel.ai_next;
     }
     next = hquery->ai->nodes;
@@ -361,7 +364,7 @@ static void end_hquery(struct host_query *hquery, ares_status_t status)
   hquery_free(hquery, ARES_FALSE);
 }
 
-ares_bool_t ares__is_localhost(const char *name)
+ares_bool_t ares_is_localhost(const char *name)
 {
   /* RFC6761 6.3 says : The domain "localhost." and any names falling within
    * ".localhost." */
@@ -371,7 +374,7 @@ ares_bool_t ares__is_localhost(const char *name)
     return ARES_FALSE; /* LCOV_EXCL_LINE: DefensiveCoding */
   }
 
-  if (strcmp(name, "localhost") == 0) {
+  if (ares_strcaseeq(name, "localhost")) {
     return ARES_TRUE;
   }
 
@@ -380,7 +383,8 @@ ares_bool_t ares__is_localhost(const char *name)
     return ARES_FALSE;
   }
 
-  if (strcmp(name + (len - 10 /* strlen(".localhost") */), ".localhost") == 0) {
+  if (ares_strcaseeq(name + (len - 10 /* strlen(".localhost") */),
+                     ".localhost")) {
     return ARES_TRUE;
   }
 
@@ -393,11 +397,11 @@ static ares_status_t file_lookup(struct host_query *hquery)
   ares_status_t             status;
 
   /* Per RFC 7686, reject queries for ".onion" domain names with NXDOMAIN. */
-  if (ares__is_onion_domain(hquery->name)) {
+  if (ares_is_onion_domain(hquery->name)) {
     return ARES_ENOTFOUND;
   }
 
-  status = ares__hosts_search_host(
+  status = ares_hosts_search_host(
     hquery->channel,
     (hquery->hints.ai_flags & ARES_AI_ENVHOSTS) ? ARES_TRUE : ARES_FALSE,
     hquery->name, &entry);
@@ -406,7 +410,7 @@ static ares_status_t file_lookup(struct host_query *hquery)
     goto done;
   }
 
-  status = ares__hosts_entry_to_addrinfo(
+  status = ares_hosts_entry_to_addrinfo(
     entry, hquery->name, hquery->hints.ai_family, hquery->port,
     (hquery->hints.ai_flags & ARES_AI_CANONNAME) ? ARES_TRUE : ARES_FALSE,
     hquery->ai);
@@ -421,11 +425,15 @@ done:
    * SHOULD recognize localhost names as special and SHOULD always return the
    * IP loopback address for address queries".
    * We will also ignore ALL errors when trying to resolve localhost, such
-   * as permissions errors reading /etc/hosts or a malformed /etc/hosts */
-  if (status != ARES_SUCCESS && status != ARES_ENOMEM &&
-      ares__is_localhost(hquery->name)) {
-    return ares__addrinfo_localhost(hquery->name, hquery->port, &hquery->hints,
-                                    hquery->ai);
+   * as permissions errors reading /etc/hosts or a malformed /etc/hosts.
+   *
+   * Also, just because the query itself returned success from /etc/hosts
+   * lookup doesn't mean it returned everything it needed to for all requested
+   * address families. As long as we're not on a critical out of memory
+   * condition pass it through to fill in any other address classes. */
+  if (status != ARES_ENOMEM && ares_is_localhost(hquery->name)) {
+    return ares_addrinfo_localhost(hquery->name, hquery->port, &hquery->hints,
+                                   hquery->ai);
   }
 
   return status;
@@ -439,7 +447,7 @@ static void next_lookup(struct host_query *hquery, ares_status_t status)
        * queries for localhost names to their configured caching DNS
        * server(s)."
        * Otherwise, DNS lookup. */
-      if (!ares__is_localhost(hquery->name) && next_dns_lookup(hquery)) {
+      if (!ares_is_localhost(hquery->name) && next_dns_lookup(hquery)) {
         break;
       }
 
@@ -476,12 +484,24 @@ static void terminate_retries(const struct host_query *hquery,
     return;
   }
 
-  query = ares__htable_szvp_get_direct(channel->queries_by_qid, term_qid);
+  query = ares_htable_szvp_get_direct(channel->queries_by_qid, term_qid);
   if (query == NULL) {
     return;
   }
 
   query->no_retries = ARES_TRUE;
+}
+
+static ares_bool_t ai_has_ipv4(struct ares_addrinfo *ai)
+{
+  struct ares_addrinfo_node *node;
+
+  for (node = ai->nodes; node != NULL; node = node->ai_next) {
+    if (node->ai_family == AF_INET) {
+      return ARES_TRUE;
+    }
+  }
+  return ARES_FALSE;
 }
 
 static void host_callback(void *arg, ares_status_t status, size_t timeouts,
@@ -497,9 +517,29 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
       addinfostatus = ARES_EBADRESP; /* LCOV_EXCL_LINE: DefensiveCoding */
     } else {
       addinfostatus =
-        ares__parse_into_addrinfo(dnsrec, ARES_TRUE, hquery->port, hquery->ai);
+        ares_parse_into_addrinfo(dnsrec, ARES_TRUE, hquery->port, hquery->ai);
     }
-    if (addinfostatus == ARES_SUCCESS) {
+
+    /* We sent out ipv4 and ipv6 requests simultaneously.  If we got a
+     * successful ipv4 response, we want to go ahead and tell the ipv6 request
+     * that if it fails or times out to not try again since we have the data
+     * we need.
+     *
+     * Our initial implementation of this would terminate retries if we got any
+     * successful response (ipv4 _or_ ipv6).  But we did get some user-reported
+     * issues with this that had bad system configs and odd behavior:
+     *  https://github.com/alpinelinux/docker-alpine/issues/366
+     *
+     * Essentially the ipv6 query succeeded but the ipv4 query failed or timed
+     * out, and so we only returned the ipv6 address, but the host couldn't
+     * use ipv6.  If we continued to allow ipv4 retries it would have found a
+     * server that worked and returned both address classes (this is clearly
+     * unexpected behavior).
+     *
+     * At some point down the road if ipv6 actually becomes required and
+     * reliable we can drop this ipv4 check.
+     */
+    if (addinfostatus == ARES_SUCCESS && ai_has_ipv4(hquery->ai)) {
       terminate_retries(hquery, ares_dns_record_get_id(dnsrec));
     }
   }
@@ -528,10 +568,9 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
         hquery->nodata_cnt++;
       }
       next_lookup(hquery, hquery->nodata_cnt ? ARES_ENODATA : status);
-    } else if (
-        (status == ARES_ESERVFAIL || status == ARES_EREFUSED) &&
-        ares__name_label_cnt(hquery->names[hquery->next_name_idx-1]) == 1
-      ) {
+    } else if ((status == ARES_ESERVFAIL || status == ARES_EREFUSED) &&
+               ares_name_label_cnt(hquery->names[hquery->next_name_idx - 1]) ==
+                 1) {
       /* Issue #852, systemd-resolved may return SERVFAIL or REFUSED on a
        * single label domain name. */
       next_lookup(hquery, hquery->nodata_cnt ? ARES_ENODATA : status);
@@ -541,6 +580,57 @@ static void host_callback(void *arg, ares_status_t status, size_t timeouts,
   }
 
   /* at this point we keep on waiting for the next query to finish */
+}
+
+/* Per POSIX getaddrinfo(), when no node/hostname is provided the returned
+ * addresses are synthesized from the service: the wildcard address when
+ * ARES_AI_PASSIVE is set (suitable for bind()ing a listening socket),
+ * otherwise the loopback address (suitable for connect()ing to a peer on the
+ * local host). */
+static ares_status_t
+  ares_append_nulladdr(unsigned short                    port,
+                       const struct ares_addrinfo_hints *hints,
+                       struct ares_addrinfo             *ai)
+{
+  int                        family  = hints->ai_family;
+  ares_bool_t                passive = ARES_FALSE;
+  ares_status_t              status;
+  struct ares_addrinfo_node *node;
+
+  if (hints->ai_flags & ARES_AI_PASSIVE) {
+    passive = ARES_TRUE;
+  }
+
+  if (family == AF_INET6 || family == AF_UNSPEC) {
+    struct ares_in6_addr addr6;
+    memset(&addr6, 0, sizeof(addr6)); /* wildcard "::" */
+    if (!passive) {
+      ares_inet_pton(AF_INET6, "::1", &addr6);
+    }
+    status = ares_append_ai_node(AF_INET6, port, 0, &addr6, &ai->nodes);
+    if (status != ARES_SUCCESS) {
+      return status; /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+
+  if (family == AF_INET || family == AF_UNSPEC) {
+    struct in_addr addr4;
+    memset(&addr4, 0, sizeof(addr4)); /* wildcard "0.0.0.0" */
+    if (!passive) {
+      ares_inet_pton(AF_INET, "127.0.0.1", &addr4);
+    }
+    status = ares_append_ai_node(AF_INET, port, 0, &addr4, &ai->nodes);
+    if (status != ARES_SUCCESS) {
+      return status; /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+
+  for (node = ai->nodes; node != NULL; node = node->ai_next) {
+    node->ai_socktype = hints->ai_socktype;
+    node->ai_protocol = hints->ai_protocol;
+  }
+
+  return ARES_SUCCESS;
 }
 
 static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
@@ -567,32 +657,31 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
     return;
   }
 
-  if (ares__is_onion_domain(name)) {
+  /* POSIX getaddrinfo() requires that at least one of node (name) or service
+   * be provided. */
+  if (name == NULL && service == NULL) {
+    callback(arg, ARES_ENOTFOUND, 0, NULL);
+    return;
+  }
+
+  if (ares_is_onion_domain(name)) {
     callback(arg, ARES_ENOTFOUND, 0, NULL);
     return;
   }
 
   if (service) {
     if (hints->ai_flags & ARES_AI_NUMERICSERV) {
-      unsigned long val;
-      errno = 0;
-      val   = strtoul(service, NULL, 0);
-      if ((val == 0 && errno != 0) || val > 65535) {
+      if (!ares_parse_port(service, &port, ARES_TRUE)) {
         callback(arg, ARES_ESERVICE, 0, NULL);
         return;
       }
-      port = (unsigned short)val;
     } else {
       port = lookup_service(service, 0);
       if (!port) {
-        unsigned long val;
-        errno = 0;
-        val   = strtoul(service, NULL, 0);
-        if ((val == 0 && errno != 0) || val > 65535) {
+        if (!ares_parse_port(service, &port, ARES_TRUE)) {
           callback(arg, ARES_ESERVICE, 0, NULL);
           return;
         }
-        port = (unsigned short)val;
       }
     }
   }
@@ -600,6 +689,19 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
   ai = ares_malloc_zero(sizeof(*ai));
   if (!ai) {
     callback(arg, ARES_ENOMEM, 0, NULL);
+    return;
+  }
+
+  /* No node/hostname was provided (service-only lookup): synthesize wildcard
+   * or loopback addresses from the resolved port instead of issuing a query. */
+  if (name == NULL) {
+    status = ares_append_nulladdr(port, hints, ai);
+    if (status != ARES_SUCCESS) {
+      ares_freeaddrinfo(ai);               /* LCOV_EXCL_LINE: OutOfMemory */
+      callback(arg, (int)status, 0, NULL); /* LCOV_EXCL_LINE: OutOfMemory */
+      return;                              /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+    callback(arg, ARES_SUCCESS, 0, ai);
     return;
   }
 
@@ -630,7 +732,7 @@ static void ares_getaddrinfo_int(ares_channel_t *channel, const char *name,
   }
 
   status =
-    ares__search_name_list(channel, name, &hquery->names, &hquery->names_cnt);
+    ares_search_name_list(channel, name, &hquery->names, &hquery->names_cnt);
   if (status != ARES_SUCCESS) {
     hquery_free(hquery, ARES_TRUE);
     callback(arg, (int)status, 0, NULL);
@@ -659,9 +761,9 @@ void ares_getaddrinfo(ares_channel_t *channel, const char *name,
   if (channel == NULL) {
     return;
   }
-  ares__channel_lock(channel);
+  ares_channel_lock(channel);
   ares_getaddrinfo_int(channel, name, service, hints, callback, arg);
-  ares__channel_unlock(channel);
+  ares_channel_unlock(channel);
 }
 
 static ares_bool_t next_dns_lookup(struct host_query *hquery)

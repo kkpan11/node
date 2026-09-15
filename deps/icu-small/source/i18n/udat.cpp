@@ -162,7 +162,7 @@ udat_open(UDateFormatStyle  timeStyle,
         }
     }
     else {
-        UnicodeString pat((UBool)(patternLength == -1), pattern, patternLength);
+        UnicodeString pat(patternLength == -1, pattern, patternLength);
 
         if (locale == nullptr) {
             fmt = new SimpleDateFormat(pat, *status);
@@ -182,7 +182,7 @@ udat_open(UDateFormatStyle  timeStyle,
     }
 
     if (tzID != nullptr) {
-        TimeZone *zone = TimeZone::createTimeZone(UnicodeString((UBool)(tzIDLength == -1), tzID, tzIDLength));
+        TimeZone* zone = TimeZone::createTimeZone(UnicodeString(tzIDLength == -1, tzID, tzIDLength));
         if (zone == nullptr) {
             *status = U_MEMORY_ALLOCATION_ERROR;
             delete fmt;
@@ -359,7 +359,7 @@ udat_parse(    const    UDateFormat*        format,
 {
     if(U_FAILURE(*status)) return (UDate)0;
 
-    const UnicodeString src((UBool)(textLength == -1), text, textLength);
+    const UnicodeString src(textLength == -1, text, textLength);
     ParsePosition pp;
     int32_t stackParsePos = 0;
     UDate res;
@@ -392,7 +392,7 @@ udat_parseCalendar(const    UDateFormat*    format,
 {
     if(U_FAILURE(*status)) return;
 
-    const UnicodeString src((UBool)(textLength == -1), text, textLength);
+    const UnicodeString src(textLength == -1, text, textLength);
     ParsePosition pp;
     int32_t stackParsePos = 0;
 
@@ -581,7 +581,7 @@ udat_applyPattern(  UDateFormat     *format,
                     const   char16_t        *pattern,
                     int32_t         patternLength)
 {
-    const UnicodeString pat((UBool)(patternLength == -1), pattern, patternLength);
+    const UnicodeString pat(patternLength == -1, pattern, patternLength);
     UErrorCode status = U_ZERO_ERROR;
 
     verifyIsSimpleDateFormat(format, &status);
@@ -643,6 +643,14 @@ udat_getSymbols(const   UDateFormat     *fmt,
 
     case UDAT_AM_PMS:
         res = syms->getAmPmStrings(count);
+        break;
+
+    case UDAT_AM_PMS_NARROW:
+        res = syms->getAmPmStrings(count, DateFormatSymbols::FORMAT, DateFormatSymbols::NARROW);
+        break;
+
+    case UDAT_AM_PMS_WIDE:
+        res = syms->getAmPmStrings(count, DateFormatSymbols::FORMAT, DateFormatSymbols::WIDE);
         break;
 
     case UDAT_LOCALIZED_CHARS:
@@ -793,6 +801,14 @@ udat_countSymbols(    const    UDateFormat                *fmt,
 
     case UDAT_AM_PMS:
         syms->getAmPmStrings(count);
+        break;
+
+    case UDAT_AM_PMS_NARROW:
+        syms->getAmPmStrings(count, DateFormatSymbols::FORMAT, DateFormatSymbols::NARROW);
+        break;
+
+    case UDAT_AM_PMS_WIDE:
+        syms->getAmPmStrings(count, DateFormatSymbols::FORMAT, DateFormatSymbols::WIDE);
         break;
 
     case UDAT_LOCALIZED_CHARS:
@@ -1115,6 +1131,20 @@ public:
     }
 
     static void
+        setAmPmNarrow(DateFormatSymbols *syms, int32_t index,
+        const char16_t *value, int32_t valueLength, UErrorCode &errorCode)
+    {
+        setSymbol(syms->fNarrowAmPms, syms->fNarrowAmPmsCount, index, value, valueLength, errorCode);
+    }
+
+    static void
+        setAmPmWide(DateFormatSymbols *syms, int32_t index,
+        const char16_t *value, int32_t valueLength, UErrorCode &errorCode)
+    {
+        setSymbol(syms->fWideAmPms, syms->fWideAmPmsCount, index, value, valueLength, errorCode);
+    }
+
+    static void
         setLocalPatternChars(DateFormatSymbols *syms,
         const char16_t *value, int32_t valueLength, UErrorCode &errorCode)
     {
@@ -1238,6 +1268,14 @@ udat_setSymbols(    UDateFormat             *format,
         DateFormatSymbolsSingleSetter::setAmPm(syms, index, value, valueLength, *status);
         break;
 
+    case UDAT_AM_PMS_NARROW:
+        DateFormatSymbolsSingleSetter::setAmPmNarrow(syms, index, value, valueLength, *status);
+        break;
+
+    case UDAT_AM_PMS_WIDE:
+        DateFormatSymbolsSingleSetter::setAmPmWide(syms, index, value, valueLength, *status);
+        break;
+
     case UDAT_LOCALIZED_CHARS:
         DateFormatSymbolsSingleSetter::setLocalPatternChars(syms, value, valueLength, *status);
         break;
@@ -1355,8 +1393,8 @@ udat_applyPatternRelative(UDateFormat *format,
 {
     verifyIsRelativeDateFormat(format, status);
     if(U_FAILURE(*status)) return;
-    const UnicodeString datePat((UBool)(datePatternLength == -1), datePattern, datePatternLength);
-    const UnicodeString timePat((UBool)(timePatternLength == -1), timePattern, timePatternLength);
+    const UnicodeString datePat(datePatternLength == -1, datePattern, datePatternLength);
+    const UnicodeString timePat(timePatternLength == -1, timePattern, timePatternLength);
     ((RelativeDateFormat*)format)->applyPatterns(datePat, timePat, *status);
 }
 

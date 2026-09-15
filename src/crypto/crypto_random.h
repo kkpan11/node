@@ -32,10 +32,11 @@ struct RandomBytesTraits final {
       unsigned int offset,
       RandomBytesConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const RandomBytesConfig& params,
-      ByteSource* out_);
+  static bool DeriveBits(Environment* env,
+                         const RandomBytesConfig& params,
+                         ByteSource* out_,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const RandomBytesConfig& params,
@@ -45,9 +46,9 @@ struct RandomBytesTraits final {
 using RandomBytesJob = DeriveBitsJob<RandomBytesTraits>;
 
 struct RandomPrimeConfig final : public MemoryRetainer {
-  BignumPointer prime;
-  BignumPointer rem;
-  BignumPointer add;
+  ncrypto::BignumPointer prime;
+  ncrypto::BignumPointer rem;
+  ncrypto::BignumPointer add;
   int bits;
   bool safe;
   void MemoryInfo(MemoryTracker* tracker) const override;
@@ -67,10 +68,11 @@ struct RandomPrimeTraits final {
       unsigned int offset,
       RandomPrimeConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const RandomPrimeConfig& params,
-      ByteSource* out_);
+  static bool DeriveBits(Environment* env,
+                         const RandomPrimeConfig& params,
+                         ByteSource* out_,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const RandomPrimeConfig& params,
@@ -80,7 +82,7 @@ struct RandomPrimeTraits final {
 using RandomPrimeJob = DeriveBitsJob<RandomPrimeTraits>;
 
 struct CheckPrimeConfig final : public MemoryRetainer {
-  BignumPointer candidate;
+  ncrypto::BignumPointer candidate;
   int checks = 1;
 
   void MemoryInfo(MemoryTracker* tracker) const override;
@@ -101,10 +103,11 @@ struct CheckPrimeTraits final {
       unsigned int offset,
       CheckPrimeConfig* params);
 
-  static bool DeriveBits(
-      Environment* env,
-      const CheckPrimeConfig& params,
-      ByteSource* out);
+  static bool DeriveBits(Environment* env,
+                         const CheckPrimeConfig& params,
+                         ByteSource* out,
+                         CryptoJobMode mode,
+                         CryptoErrorStore* errors);
 
   static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
                                                 const CheckPrimeConfig& params,

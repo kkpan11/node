@@ -1,20 +1,12 @@
 #include "path.h"
 #include <string>
 #include <vector>
+#include "ada.h"
 #include "env-inl.h"
 #include "node_internals.h"
+#include "node_url.h"
 
 namespace node {
-
-#ifdef _WIN32
-constexpr bool IsPathSeparator(const char c) noexcept {
-  return c == '\\' || c == '/';
-}
-#else   // POSIX
-constexpr bool IsPathSeparator(const char c) noexcept {
-  return c == '/';
-}
-#endif  // _WIN32
 
 std::string NormalizeString(const std::string_view path,
                             bool allowAboveRoot,
@@ -88,16 +80,11 @@ std::string NormalizeString(const std::string_view path,
 }
 
 #ifdef _WIN32
-constexpr bool IsWindowsDeviceRoot(const char c) noexcept {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
 std::string PathResolve(Environment* env,
                         const std::vector<std::string_view>& paths) {
   std::string resolvedDevice = "";
   std::string resolvedTail = "";
   bool resolvedAbsolute = false;
-  bool slashCheck = false;
   const size_t numArgs = paths.size();
   auto cwd = env->GetCwd(env->exec_path());
 
@@ -115,7 +102,7 @@ std::string PathResolve(Environment* env,
       // a UNC path at this points, because UNC paths are always absolute.
       std::string resolvedDevicePath;
       const std::string envvar = "=" + resolvedDevice;
-      credentials::SafeGetenv(envvar.c_str(), &resolvedDevicePath);
+      credentials::SafeGetenv(envvar.c_str(), &resolvedDevicePath, env);
       path = resolvedDevicePath.empty() ? cwd : resolvedDevicePath;
 
       // Verify that a cwd was found and that it actually points
@@ -127,10 +114,6 @@ std::string PathResolve(Environment* env,
       }
     }
 
-    if (static_cast<size_t>(i) == numArgs - 1 &&
-        IsPathSeparator(path[path.length() - 1])) {
-      slashCheck = true;
-    }
     const size_t len = path.length();
     int rootEnd = 0;
     std::string device = "";
@@ -232,27 +215,15 @@ std::string PathResolve(Environment* env,
   // Normalize the tail path
   resolvedTail = NormalizeString(resolvedTail, !resolvedAbsolute, "\\");
 
-  if (!resolvedAbsolute) {
-    if (!resolvedDevice.empty() || !resolvedTail.empty()) {
-      return resolvedDevice + resolvedTail;
-    }
-    return ".";
+  if (resolvedAbsolute) {
+    return resolvedDevice + "\\" + resolvedTail;
   }
 
-  if (resolvedTail.empty()) {
-    if (slashCheck) {
-      return resolvedDevice + "\\";
-    }
-    return resolvedDevice;
+  if (!resolvedDevice.empty() || !resolvedTail.empty()) {
+    return resolvedDevice + resolvedTail;
   }
 
-  if (slashCheck) {
-    if (resolvedTail == "\\") {
-      return resolvedDevice + "\\";
-    }
-    return resolvedDevice + "\\" + resolvedTail + "\\";
-  }
-  return resolvedDevice + "\\" + resolvedTail;
+  return ".";
 }
 #else   // _WIN32
 std::string PathResolve(Environment* env,
@@ -261,14 +232,9 @@ std::string PathResolve(Environment* env,
   bool resolvedAbsolute = false;
   auto cwd = env->GetCwd(env->exec_path());
   const size_t numArgs = paths.size();
-  bool slashCheck = false;
 
   for (int i = numArgs - 1; i >= -1 && !resolvedAbsolute; i--) {
     const std::string& path = (i >= 0) ? std::string(paths[i]) : cwd;
-
-    if (static_cast<size_t>(i) == numArgs - 1 && path.back() == '/') {
-      slashCheck = true;
-    }
 
     if (!path.empty()) {
       resolvedPath = std::string(path) + "/" + resolvedPath;
@@ -283,21 +249,15 @@ std::string PathResolve(Environment* env,
   // Normalize the path
   auto normalizedPath = NormalizeString(resolvedPath, !resolvedAbsolute, "/");
 
-  if (!resolvedAbsolute) {
-    if (normalizedPath.empty()) {
-      return ".";
-    }
-    if (slashCheck) {
-      return normalizedPath + "/";
-    }
-    return normalizedPath;
+  if (resolvedAbsolute) {
+    return "/" + normalizedPath;
   }
 
-  if (normalizedPath.empty() || normalizedPath == "/") {
-    return "/";
+  if (normalizedPath.empty()) {
+    return ".";
   }
 
-  return slashCheck ? "/" + normalizedPath + "/" : "/" + normalizedPath;
+  return normalizedPath;
 }
 #endif  // _WIN32
 
@@ -359,6 +319,46 @@ void FromNamespacedPath(std::string* path) {
     *path = path->substr(4);
   }
 #endif
+}
+
+// Check if a path looks like an absolute path or file URL.
+bool IsAbsoluteFilePath(std::string_view path) {
+  if (path.starts_with("file://")) {
+    return true;
+  }
+#ifdef _WIN32
+  if (path.size() > 0 && path[0] == '\\') return true;
+  if (IsWindowsDriveLetter(path)) return true;
+#endif
+  if (path.size() > 0 && path[0] == '/') return true;
+  return false;
+}
+
+// Normalizes paths by resolving file URLs and converting to a consistent
+// format with forward slashes.
+std::string NormalizeFileURLOrPath(Environment* env, std::string_view path) {
+  std::string normalized_string(path);
+  constexpr std::string_view file_scheme = "file://";
+  if (normalized_string.starts_with(file_scheme)) {
+    auto out = ada::parse<ada::url_aggregator>(normalized_string);
+    auto file_path = url::FileURLToPath(env, *out);
+    if (!file_path.has_value()) {
+      return std::string();
+    }
+    normalized_string = file_path.value();
+  }
+  normalized_string = NormalizeString(normalized_string, false, "/");
+#ifdef _WIN32
+  if (IsWindowsDriveLetter(normalized_string)) {
+    normalized_string[0] = ToLower(normalized_string[0]);
+  }
+  for (char& c : normalized_string) {
+    if (c == '\\') {
+      c = '/';
+    }
+  }
+#endif
+  return normalized_string;
 }
 
 }  // namespace node

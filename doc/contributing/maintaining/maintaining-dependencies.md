@@ -11,30 +11,31 @@ This a list of all the dependencies:
 * [acorn][]
 * [ada][]
 * [amaro][]
-* [base64][]
 * [brotli][]
 * [c-ares][]
-* [cjs-module-lexer][]
+* [merve][]
 * [corepack][]
 * [googletest][]
 * [histogram][]
 * [icu-small][]
+* [inspector\_protocol][inspector_protocol]
+* [libffi][]
 * [libuv][]
 * [llhttp][]
-* [minimatch][]
 * [nghttp2][]
 * [nghttp3][]
 * [ngtcp2][]
 * [npm][]
 * [openssl][]
+* [perfetto][]
 * [postject][]
 * [simdjson][]
-* [simdutf][]
 * [sqlite][]
 * [undici][]
 * [uvwasi][]
 * [V8][]
 * [zlib][]
+* [zstd][]
 
 Any code which meets one or more of these conditions should
 be managed as a dependency:
@@ -145,6 +146,48 @@ can be added as a non-externalizable dependency. In this case
 simply add the path to the JavaScript file in the `deps_files`
 list in the `node.gyp` file.
 
+## Common approach for dependencies with WASM components
+
+WASM components within dependencies are most often built
+outside of the regular Node.js `make build` step. They also
+require different tools.
+
+It is important that the tools and their versions used to build
+WASM components shipped within Node.js are well documented and
+be available if needed to rebuild/update older Node.js versions.
+
+In order to minimize the different number of tools and versions
+used to build WASM components and to document and ensure future
+availability, the project builds and maintains a common
+[wasm-builder](https://github.com/nodejs/wasm-builder) container
+that should be used to build WASM components in Node.js
+dependencies.
+
+The container provides a durable copy of the versions of the tools
+used for a specific build which are under the control of the Node.js
+project. In addition, the tools and versions are documented through metadata
+within the container in the `/home/node/metadata directory`.
+
+The available tools can be found by looking at the current version of the
+[Dockerfile](https://github.com/nodejs/wasm-builder/blob/main/container-build-info/Dockerfile)
+used to create the container.
+
+If additional WASM tool are needed beyond those available in the
+container, additions should be PR'd into the wasm-builder container.
+
+Examples of using the container include:
+
+* [build/wasm.js](https://github.com/nodejs/undici/blob/main/build/wasm.js) from undici
+* [tools/build-wasm.js](https://github.com/nodejs/amaro/blob/main/tools/build-wasm.js) from amaro
+
+In addition to using the container to build WASM components, the goal is also
+for the WASM components and final files that are shipped with Node.js to be
+built by the [dep-updaters](https://github.com/nodejs/node/tree/main/tools/dep_updaters)
+that are run on a regular basis and that they use only the files available in the Node.js
+repo for the dependency. For example, being able to rebuild the WASM and files that
+we ship in Node.js using only the files in
+[../deps/undici](https://github.com/nodejs/node/tree/main/deps/undici).
+
 ## Updating dependencies
 
 Most dependencies are automatically updated by
@@ -195,12 +238,12 @@ used for the homonym generic-purpose lossless compression algorithm.
 The [c-ares](https://github.com/c-ares/c-ares) is a C library
 for asynchronous DNS requests.
 
-### cjs-module-lexer
+### merve
 
-The [cjs-module-lexer](https://github.com/nodejs/node/tree/HEAD/deps/cjs-module-lexer)
+The [merve](https://github.com/nodejs/node/tree/HEAD/deps/merve)
 dependency is used within the Node.js ESM implementation to detect the
 named exports of a CommonJS module.
-See [maintaining-cjs-module-lexer][] for more information.
+See [maintaining-merve][] for more information.
 
 ### corepack
 
@@ -222,12 +265,23 @@ C++ testing and mocking framework.
 The [histogram](https://github.com/HdrHistogram/HdrHistogram_c) dependency is
 a C port of High Dynamic Range (HDR) Histogram.
 
-### ic
+### icu-small
 
 The [icu](http://site.icu-project.org) is widely used set of C/C++
 and Java libraries providing Unicode and Globalization
 support for software applications.
 See [maintaining-icu][] for more information.
+
+### inspector\_protocol
+
+The [inspector\_protocol](https://chromium.googlesource.com/deps/inspector_protocol/)
+is Chromium's of code generators and templates for the inspector protocol.
+See [this doc](../../../tools/inspector_protocol/README.md) for more information.
+
+### libffi
+
+The [libffi](https://github.com/libffi/libffi) dependency is a portable foreign
+function interface library used by `node:ffi`.
 
 ### libuv
 
@@ -240,11 +294,6 @@ It was primarily developed for use by Node.js.
 The [llhttp](https://github.com/nodejs/llhttp) dependency is
 the http parser used by Node.js.
 See [maintaining-http][] for more information.
-
-### minimatch
-
-The [minimatch](https://github.com/isaacs/minimatch) dependency is a
-minimal matching utility.
 
 ### nghttp2
 
@@ -304,6 +353,11 @@ the main openssl/openssl releases with the addition of APIs to support
 the QUIC protocol.
 See [maintaining-openssl][] for more information.
 
+### perfetto
+
+The [perfetto](https://github.com/google/perfetto) dependency is used to
+generate performance traces for Node.js and V8.
+
 ### postject
 
 The [postject](https://github.com/nodejs/postject) dependency is used for the
@@ -313,11 +367,6 @@ The [postject](https://github.com/nodejs/postject) dependency is used for the
 
 The [simdjson](https://github.com/simdjson/simdjson) dependency is
 a C++ library for fast JSON parsing.
-
-### simdutf
-
-The [simdutf](https://github.com/simdutf/simdutf) dependency is
-a C++ library for fast UTF-8 decoding and encoding.
 
 ### sqlite
 
@@ -351,38 +400,44 @@ dependency lossless data-compression library,
 it comes from the Chromium team's zlib fork which incorporated
 performance improvements not currently available in standard zlib.
 
+### zstd
+
+The [zstd](https://github.com/facebook/zstd) dependency is used for compression
+according to [RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878).
+
 [acorn]: #acorn
 [ada]: #ada
 [amaro]: #amaro
-[base64]: #base64
 [brotli]: #brotli
 [c-ares]: #c-ares
-[cjs-module-lexer]: #cjs-module-lexer
 [corepack]: #corepack
 [dependency-update-action]: ../../../.github/workflows/tools.yml
 [googletest]: #googletest
 [histogram]: #histogram
 [icu-small]: #icu-small
+[inspector_protocol]: #inspector_protocol
+[libffi]: #libffi
 [libuv]: #libuv
 [llhttp]: #llhttp
 [maintaining-V8]: ./maintaining-V8.md
-[maintaining-cjs-module-lexer]: ./maintaining-cjs-module-lexer.md
 [maintaining-http]: ./maintaining-http.md
 [maintaining-icu]: ./maintaining-icu.md
+[maintaining-merve]: ./maintaining-merve.md
 [maintaining-openssl]: ./maintaining-openssl.md
 [maintaining-web-assembly]: ./maintaining-web-assembly.md
-[minimatch]: #minimatch
+[merve]: #merve
 [nghttp2]: #nghttp2
 [nghttp3]: #nghttp3
 [ngtcp2]: #ngtcp2
 [npm]: #npm
 [openssl]: #openssl
+[perfetto]: #perfetto
 [postject]: #postject
 [simdjson]: #simdjson
-[simdutf]: #simdutf
 [sqlite]: #sqlite
 [undici]: #undici
 [update-openssl-action]: ../../../.github/workflows/update-openssl.yml
 [uvwasi]: #uvwasi
 [v8]: #v8
 [zlib]: #zlib
+[zstd]: #zstd

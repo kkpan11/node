@@ -31,7 +31,7 @@
 from __future__ import print_function
 from typing import Dict
 import logging
-import optparse
+import argparse
 import os
 import re
 import signal
@@ -126,7 +126,7 @@ class ProgressIndicator(object):
     if failure.output.stdout:
       output += ["--- stdout ---"]
       output += [failure.output.stdout.strip()]
-    output += ["Command: %s" % EscapeCommand(failure.command)]
+    output += ["Command: %s" % failure.test.GetFailureCommand(failure.command)]
     if failure.HasCrashed():
       output += ["--- %s ---" % PrintCrashed(failure.output.exit_code)]
     if failure.HasTimedOut():
@@ -174,7 +174,7 @@ class ProgressIndicator(object):
       raise
     self.Done()
     return {
-      'allPassed': not self.failed,
+      'allPassed': not self.failed and not self.shutdown_event.is_set(),
       'failed': self.failed,
     }
 
@@ -316,9 +316,7 @@ class DotsProgressIndicator(SimpleProgressIndicator):
 
 class ActionsAnnotationProgressIndicator(DotsProgressIndicator):
   def AboutToRun(self, case):
-    case.additional_flags = case.additional_flags.copy() if hasattr(case, 'additional_flags') else []
-    case.additional_flags.append('--test-reporter=./tools/github_reporter/index.js')
-    case.additional_flags.append('--test-reporter-destination=stdout')
+    pass
 
   def GetAnnotationInfo(self, test, output):
     traceback = output.stdout + output.stderr
@@ -362,9 +360,7 @@ class TapProgressIndicator(SimpleProgressIndicator):
     # Print test name as (for example) "parallel/test-assert".  Tests that are
     # scraped from the addons documentation are all named test.js, making it
     # hard to decipher what test is running when only the filename is printed.
-    prefix = abspath(join(dirname(__file__), '../test')) + os.sep
-    command = output.command[-1]
-    command = NormalizePath(command, prefix)
+    command = output.test.GetReportingName(output.command)
 
     if output.UnexpectedOutput():
       status_line = 'not ok %i %s' % (self._done, command)
@@ -427,9 +423,7 @@ class DeoptsCheckProgressIndicator(SimpleProgressIndicator):
     # Print test name as (for example) "parallel/test-assert".  Tests that are
     # scraped from the addons documentation are all named test.js, making it
     # hard to decipher what test is running when only the filename is printed.
-    prefix = abspath(join(dirname(__file__), '../test')) + os.sep
-    command = output.command[-1]
-    command = NormalizePath(command, prefix)
+    command = output.test.GetReportingName(output.command)
 
     stdout = output.output.stdout.strip()
     printed_file = False
@@ -475,7 +469,7 @@ class CompactProgressIndicator(ProgressIndicator):
       stderr = output.output.stderr.strip()
       if len(stderr):
         print(self.templates['stderr'] % stderr)
-      print("Command: %s" % EscapeCommand(output.command))
+      print("Command: %s" % output.test.GetFailureCommand(output.command))
       if output.HasCrashed():
         print("--- %s ---" % PrintCrashed(output.output.exit_code))
       if output.HasTimedOut():
@@ -575,6 +569,13 @@ class TestCase(object):
     self.serial_id = 0
     self.thread_id = 0
 
+  def GetReportingName(self, command):
+    prefix = abspath(join(dirname(__file__), '../test')) + os.sep
+    return NormalizePath(command[-1], prefix)
+
+  def GetFailureCommand(self, command):
+    return EscapeCommand(command)
+
   def IsNegative(self):
     return self.context.expect_fail
 
@@ -604,12 +605,21 @@ class TestCase(object):
 
   def Run(self):
     try:
-      result = self.RunCommand(self.GetCommand(), {
+      run_configuration = self.GetRunConfiguration()
+      command = run_configuration['command']
+      envs = {}
+      if 'envs' in run_configuration:
+        envs.update(run_configuration['envs'])
+      envs.update({
         "TEST_SERIAL_ID": "%d" % self.serial_id,
         "TEST_THREAD_ID": "%d" % self.thread_id,
         "TEST_PARALLEL" : "%d" % self.parallel,
         "GITHUB_STEP_SUMMARY": "",
       })
+      result = self.RunCommand(
+        command,
+        envs
+      )
     finally:
       # Tests can leave the tty in non-blocking mode. If the test runner
       # tries to print to stdout/stderr after that and the tty buffer is
@@ -734,10 +744,11 @@ def RunProcess(context, timeout, args, **rest):
       timed_out = True
     else:
       exit_code = process.poll()
-      time.sleep(sleep_time)
-      sleep_time = sleep_time * SLEEP_TIME_FACTOR
-      if sleep_time > MAX_SLEEP_TIME:
-        sleep_time = MAX_SLEEP_TIME
+      if exit_code is None:
+        time.sleep(sleep_time)
+        sleep_time = sleep_time * SLEEP_TIME_FACTOR
+        if sleep_time > MAX_SLEEP_TIME:
+          sleep_time = MAX_SLEEP_TIME
   return (process, exit_code, timed_out)
 
 
@@ -781,6 +792,11 @@ def Execute(args, context, timeout=None, env=None, disable_core_files=False,
   for key, value in env.items():
     env_copy[key] = value
 
+  # We append NODE_SKIP_FLAG_CHECK (ref: test/common/index.js)
+  # to avoid parsing the test files twice when looking for
+  # flags or environment variables defined via // Flags: and // Env:
+  env_copy["NODE_SKIP_FLAG_CHECK"] = "true"
+
   preexec_fn = None
 
   def disableCoreFiles():
@@ -805,7 +821,7 @@ def Execute(args, context, timeout=None, env=None, disable_core_files=False,
     else:
       preexec_fn = setMaxVirtualMemory
 
-  (process, exit_code, timed_out) = RunProcess(
+  (_process, exit_code, timed_out) = RunProcess(
     context,
     timeout,
     args = args,
@@ -912,7 +928,7 @@ class LiteralTestSuite(TestSuite):
     return result
 
   def ListTests(self, current_path, path, context, arch, mode):
-    (name, rest) = CarCdr(path)
+    (name, _rest) = CarCdr(path)
     result = [ ]
     for test in self.tests_repos:
       test_name = test.GetName()
@@ -957,6 +973,8 @@ class Context(object):
     self.abort_on_timeout = abort_on_timeout
     self.v8_enable_inspector = True
     self.node_has_crypto = True
+    self.node_has_ffi = True
+    self.use_error_reporter = False
 
   def GetVm(self, arch, mode):
     if self.vm is not None:
@@ -1371,83 +1389,86 @@ ARCH_GUESS = utils.GuessArchitecture()
 
 
 def BuildOptions():
-  result = optparse.OptionParser()
-  result.add_option("-m", "--mode", help="The test modes in which to run (comma-separated)",
+  result = argparse.ArgumentParser()
+  result.add_argument("-m", "--mode", help="The test modes in which to run (comma-separated)",
       default='release')
-  result.add_option("-v", "--verbose", help="Verbose output",
+  result.add_argument("-v", "--verbose", help="Verbose output",
       default=False, action="store_true")
-  result.add_option('--logfile', dest='logfile',
+  result.add_argument('--logfile', dest='logfile',
       help='write test output to file. NOTE: this only applies the tap progress indicator')
-  result.add_option("-p", "--progress",
+  result.add_argument("-p", "--progress",
       help="The style of progress indicator (%s)" % ", ".join(PROGRESS_INDICATORS.keys()),
       choices=list(PROGRESS_INDICATORS.keys()), default="mono")
-  result.add_option("--report", help="Print a summary of the tests to be run",
+  result.add_argument("--report", help="Print a summary of the tests to be run",
       default=False, action="store_true")
-  result.add_option("-s", "--suite", help="A test suite",
+  result.add_argument("-s", "--suite", help="A test suite",
       default=[], action="append")
-  result.add_option("-t", "--timeout", help="Timeout in seconds",
-      default=120, type="int")
-  result.add_option("--arch", help='The architecture to run tests for',
+  result.add_argument("-t", "--timeout", help="Timeout in seconds",
+      default=120, type=int)
+  result.add_argument("--arch", help='The architecture to run tests for',
       default='none')
-  result.add_option("--snapshot", help="Run the tests with snapshot turned on",
+  result.add_argument("--snapshot", help="Run the tests with snapshot turned on",
       default=False, action="store_true")
-  result.add_option("--special-command", default=None)
-  result.add_option("--node-args", dest="node_args", help="Args to pass through to Node",
+  result.add_argument("--special-command", default=None)
+  result.add_argument("--node-args", dest="node_args", help="Args to pass through to Node",
       default=[], action="append")
-  result.add_option("--expect-fail", dest="expect_fail",
+  result.add_argument("--expect-fail", dest="expect_fail",
       help="Expect test cases to fail", default=False, action="store_true")
-  result.add_option("--valgrind", help="Run tests through valgrind",
+  result.add_argument("--valgrind", help="Run tests through valgrind",
       default=False, action="store_true")
-  result.add_option("--worker", help="Run parallel tests inside a worker context",
+  result.add_argument("--worker", help="Run parallel tests inside a worker context",
       default=False, action="store_true")
-  result.add_option("--check-deopts", help="Check tests for permanent deoptimizations",
+  result.add_argument("--check-deopts", help="Check tests for permanent deoptimizations",
       default=False, action="store_true")
-  result.add_option("--cat", help="Print the source of the tests",
+  result.add_argument("--cat", help="Print the source of the tests",
       default=False, action="store_true")
-  result.add_option("--flaky-tests",
+  result.add_argument("--flaky-tests",
       help="Regard tests marked as flaky (run|skip|dontcare|keep_retrying)",
       default="run")
-  result.add_option("--measure-flakiness",
+  result.add_argument("--measure-flakiness",
       help="When a test fails, re-run it x number of times",
-      default=0, type="int")
-  result.add_option("--skip-tests",
+      default=0, type=int)
+  result.add_argument("--skip-tests",
       help="Tests that should not be executed (comma-separated)",
       default="")
-  result.add_option("--warn-unused", help="Report unused rules",
+  result.add_argument("--warn-unused", help="Report unused rules",
       default=False, action="store_true")
-  result.add_option("-j", help="The number of parallel tasks to run, 0=use number of cores",
-      default=0, type="int")
-  result.add_option("-J", help="For legacy compatibility, has no effect",
+  result.add_argument("-j", help="The number of parallel tasks to run, 0=use number of cores",
+      default=0, type=int)
+  result.add_argument("-J", help="For legacy compatibility, has no effect",
       default=False, action="store_true")
-  result.add_option("--time", help="Print timing information after running",
+  result.add_argument("--time", help="Print timing information after running",
       default=False, action="store_true")
-  result.add_option("--suppress-dialogs", help="Suppress Windows dialogs for crashing tests",
+  result.add_argument("--suppress-dialogs", help="Suppress Windows dialogs for crashing tests",
         dest="suppress_dialogs", default=True, action="store_true")
-  result.add_option("--no-suppress-dialogs", help="Display Windows dialogs for crashing tests",
+  result.add_argument("--no-suppress-dialogs", help="Display Windows dialogs for crashing tests",
         dest="suppress_dialogs", action="store_false")
-  result.add_option("--shell", help="Path to node executable", default=None)
-  result.add_option("--store-unexpected-output",
+  result.add_argument("--shell", help="Path to node executable", default=None)
+  result.add_argument("--store-unexpected-output",
       help="Store the temporary JS files from tests that fails",
       dest="store_unexpected_output", default=True, action="store_true")
-  result.add_option("--no-store-unexpected-output",
+  result.add_argument("--no-store-unexpected-output",
       help="Deletes the temporary JS files from tests that fails",
       dest="store_unexpected_output", action="store_false")
-  result.add_option("-r", "--run",
+  result.add_argument("-r", "--run",
       help="Divide the tests in m groups (interleaved) and run tests from group n (--run=n,m with n < m)",
       default="")
-  result.add_option('--temp-dir',
+  result.add_argument('--temp-dir',
       help='Optional path to change directory used for tests', default=False)
-  result.add_option('--test-root',
+  result.add_argument('--test-root',
       help='Optional path to change test directory', dest='test_root', default=None)
-  result.add_option('--repeat',
+  result.add_argument('--repeat',
       help='Number of times to repeat given tests',
-      default=1, type="int")
-  result.add_option('--abort-on-timeout',
+      default=1, type=int)
+  result.add_argument('--abort-on-timeout',
       help='Send SIGABRT instead of SIGTERM to kill processes that time out',
       default=False, action="store_true", dest="abort_on_timeout")
-  result.add_option("--type",
+  result.add_argument("--type",
       help="Type of build (simple, fips, coverage)",
       default=None)
+  result.add_argument("--error-reporter",
+      help="use error reporter if the test uses node:test",
+      default=True, action="store_true")
   return result
 
 
@@ -1527,6 +1548,8 @@ def NormalizePath(path, prefix='test/'):
   path = path.replace('\\', '/')
   if path.startswith(prefix):
     path = path[len(prefix):]
+  if '?' in path or '#' in path:
+    return path
   if path.endswith('.js'):
     path = path[:-3]
   elif path.endswith('.mjs'):
@@ -1580,10 +1603,13 @@ IGNORED_SUITES = [
   'benchmark',
   'doctool',
   'embedding',
+  'ffi',
   'internet',
   'js-native-api',
   'node-api',
   'pummel',
+  'sqlite',
+  'system-ca',
   'tick-processor',
   'v8-updates'
 ]
@@ -1593,7 +1619,7 @@ def ArgsToTestPaths(test_root, args, suites):
   if len(args) == 0 or 'default' in args:
     def_suites = [s for s in suites if s not in IGNORED_SUITES]
     args = [a for a in args if a != 'default'] + def_suites
-  subsystem_regex = re.compile(r'^[a-zA-Z-]*$')
+  subsystem_regex = re.compile(r'^[a-zA-Z0-9-]*$')
   check = lambda arg: subsystem_regex.match(arg) and (arg not in suites)
   mapped_args = ["*/test*-%s-*" % arg if check(arg) else arg for arg in args]
   paths = [SplitPath(NormalizePath(a)) for a in mapped_args]
@@ -1616,10 +1642,13 @@ def get_asan_state(vm, context):
   asan = Execute([vm, '-p', 'process.config.variables.asan'], context).stdout.strip()
   return "on" if asan == "1" else "off"
 
+def get_pointer_compression_state(vm, context):
+  pointer_compression = Execute([vm, '-p', 'process.config.variables.v8_enable_pointer_compression'], context).stdout.strip()
+  return "on" if pointer_compression == "1" else "off"
 
 def Main():
   parser = BuildOptions()
-  (options, args) = parser.parse_args()
+  (options, args) = parser.parse_known_args()
   if not ProcessOptions(options):
     parser.print_help()
     return 1
@@ -1657,9 +1686,6 @@ def Main():
   if options.check_deopts:
     options.node_args.append("--trace-opt")
     options.node_args.append("--trace-file-names")
-    # --always-turbofan is needed because many tests do not run long enough for
-    # the optimizer to kick in, so this flag will force it to run.
-    options.node_args.append("--always-turbofan")
     options.progress = "deopts"
 
   if options.worker:
@@ -1679,6 +1705,17 @@ def Main():
                     options.store_unexpected_output,
                     options.repeat,
                     options.abort_on_timeout)
+  # Remember the primary mode requested on the CLI so suites can reuse it when
+  # they need to probe for a binary outside of the normal test runner flow.
+  for requested_mode in options.mode:
+    if requested_mode:
+      context.default_mode = requested_mode
+      break
+  else:
+    context.default_mode = 'none'
+
+  if options.error_reporter:
+    context.use_error_reporter = True
 
   # Get status for tests
   sections = [ ]
@@ -1691,26 +1728,28 @@ def Main():
   all_unused = [ ]
   unclassified_tests = [ ]
   globally_unused_rules = None
-  for path in paths:
-    for arch in options.arch:
-      for mode in options.mode:
-        vm = context.GetVm(arch, mode)
-        if not exists(vm):
-          print("Can't find shell executable: '%s'" % vm)
-          continue
-        archEngineContext = Execute([vm, "-p", "process.arch"], context)
-        vmArch = archEngineContext.stdout.rstrip()
-        if archEngineContext.exit_code != 0 or vmArch == "undefined":
-          print("Can't determine the arch of: '%s'" % vm)
-          print(archEngineContext.stderr.rstrip())
-          continue
-        env = {
-          'mode': mode,
-          'system': utils.GuessOS(),
-          'arch': vmArch,
-          'type': get_env_type(vm, options.type, context),
-          'asan': get_asan_state(vm, context),
-        }
+
+  for arch in options.arch:
+    for mode in options.mode:
+      vm = context.GetVm(arch, mode)
+      if not exists(vm):
+        print("Can't find shell executable: '%s'" % vm)
+        continue
+      archEngineContext = Execute([vm, "-p", "process.arch"], context)
+      vmArch = archEngineContext.stdout.rstrip()
+      if archEngineContext.exit_code != 0 or vmArch == "undefined":
+        print("Can't determine the arch of: '%s'" % vm)
+        print(archEngineContext.stderr.rstrip())
+        continue
+      env = {
+        'mode': mode,
+        'system': utils.GuessOS(),
+        'arch': vmArch,
+        'type': get_env_type(vm, options.type, context),
+        'asan': get_asan_state(vm, context),
+        'pointer_compression': get_pointer_compression_state(vm, context),
+      }
+      for path in paths:
         test_list = root.ListTests([], path, context, arch, mode)
         unclassified_tests += test_list
         cases, unused_rules = config.ClassifyTests(test_list, env)
@@ -1732,6 +1771,11 @@ def Main():
       '-p', 'process.versions.openssl'], context)
   if has_crypto.stdout.rstrip() == 'undefined':
     context.node_has_crypto = False
+
+  has_ffi = Execute([vm,
+      '-p', 'process.config.variables.node_use_ffi'], context)
+  if has_ffi.stdout.rstrip() != 'true':
+    context.node_has_ffi = False
 
   if options.cat:
     visited = set()
@@ -1761,7 +1805,8 @@ def Main():
         sys.exit(1)
 
   def should_keep(case):
-    if any((s in case.file) for s in options.skip_tests):
+    if any(s in case.file or s in '/'.join(case.path)
+           for s in options.skip_tests):
       return False
     elif SKIP in case.outcomes:
       return False
@@ -1787,7 +1832,7 @@ def Main():
     # Must ensure the list of tests is sorted before selecting, to avoid
     # silent errors if this file is changed to list the tests in a way that
     # can be different in different machines
-    cases_to_run.sort(key=lambda c: (c.arch, c.mode, c.file))
+    cases_to_run.sort(key=lambda c: (c.arch, c.mode, c.file, c.path))
     cases_to_run = [ cases_to_run[i] for i
                      in range(options.run[0],
                                len(cases_to_run),
@@ -1811,18 +1856,19 @@ def Main():
     print()
     sys.stderr.write("--- Total time: %s ---\n" % FormatTime(duration))
     timed_tests = [ t for t in cases_to_run if not t.duration is None ]
-    timed_tests.sort(key=lambda x: x.duration)
+    timed_tests.sort(key=lambda x: x.duration, reverse=True)
     for i, entry in enumerate(timed_tests[:20], start=1):
       t = FormatTimedelta(entry.duration)
       sys.stderr.write("%4i (%s) %s\n" % (i, t, entry.GetLabel()))
 
   if result['allPassed']:
     print("\nAll tests passed.")
-  else:
+  elif result['failed']:
     print("\nFailed tests:")
     for failure in result['failed']:
-      print(EscapeCommand(failure.command))
-
+      print(failure.test.GetFailureCommand(failure.command))
+  else:
+    print("\nTest aborted.")
   return exitcode
 
 

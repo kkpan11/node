@@ -21,21 +21,21 @@ namespace crypto {
 class ManagedX509 final : public MemoryRetainer {
  public:
   ManagedX509() = default;
-  explicit ManagedX509(X509Pointer&& cert);
+  explicit ManagedX509(ncrypto::X509Pointer&& cert);
   ManagedX509(const ManagedX509& that);
   ManagedX509& operator=(const ManagedX509& that);
 
-  operator bool() const { return !!cert_; }
-  X509* get() const { return cert_.get(); }
-  ncrypto::X509View view() const { return cert_; }
-  operator ncrypto::X509View() const { return cert_; }
+  inline operator bool() const { return !!cert_; }
+  inline X509* get() const { return cert_.get(); }
+  inline ncrypto::X509View view() const { return cert_; }
+  inline operator ncrypto::X509View() const { return cert_; }
 
   void MemoryInfo(MemoryTracker* tracker) const override;
   SET_MEMORY_INFO_NAME(ManagedX509)
   SET_SELF_SIZE(ManagedX509)
 
  private:
-  X509Pointer cert_;
+  ncrypto::X509Pointer cert_;
 };
 
 class X509Certificate final : public BaseObject {
@@ -49,38 +49,41 @@ class X509Certificate final : public BaseObject {
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
   static v8::Local<v8::FunctionTemplate> GetConstructorTemplate(
       Environment* env);
-  static bool HasInstance(Environment* env, v8::Local<v8::Object> object);
+  static bool HasInstance(Environment* env, v8::Local<v8::Value> value);
+
+  static void CreateX509CertificateClass(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void IsX509Certificate(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void NewFromHandle(const v8::FunctionCallbackInfo<v8::Value>& args);
 
   static v8::MaybeLocal<v8::Object> New(
       Environment* env,
-      X509Pointer cert,
-      STACK_OF(X509)* issuer_chain = nullptr);
+      ncrypto::X509Pointer cert,
+      const STACK_OF(X509) * issuer_chain = nullptr);
 
   static v8::MaybeLocal<v8::Object> New(
       Environment* env,
       std::shared_ptr<ManagedX509> cert,
-      STACK_OF(X509)* issuer_chain = nullptr);
+      const STACK_OF(X509) * issuer_chain = nullptr);
 
-  static v8::MaybeLocal<v8::Object> GetCert(
-      Environment* env,
-      const SSLPointer& ssl);
+  static v8::MaybeLocal<v8::Object> GetCert(Environment* env,
+                                            const ncrypto::SSLPointer& ssl);
 
-  static v8::MaybeLocal<v8::Object> GetPeerCert(
-      Environment* env,
-      const SSLPointer& ssl,
-      GetPeerCertificateFlag flag);
+  static v8::MaybeLocal<v8::Object> GetPeerCert(Environment* env,
+                                                const ncrypto::SSLPointer& ssl,
+                                                GetPeerCertificateFlag flag);
 
-  static v8::Local<v8::Object> Wrap(
-      Environment* env,
-      v8::Local<v8::Object> object,
-      X509Pointer cert);
+  static v8::Local<v8::Object> Wrap(Environment* env,
+                                    v8::Local<v8::Object> object,
+                                    ncrypto::X509Pointer cert);
 
   inline BaseObjectPtr<X509Certificate> getIssuerCert() const {
     return issuer_cert_;
   }
 
   inline ncrypto::X509View view() const { return *cert_; }
-  X509* get() { return cert_->get(); }
+  inline X509* get() { return cert_->get(); }
 
   v8::MaybeLocal<v8::Value> toObject(Environment* env);
   static v8::MaybeLocal<v8::Value> toObject(Environment* env,
@@ -113,11 +116,17 @@ class X509Certificate final : public BaseObject {
   std::unique_ptr<worker::TransferData> CloneForMessaging() const override;
 
  private:
-  X509Certificate(
+  X509Certificate(Environment* env,
+                  v8::Local<v8::Object> object,
+                  std::shared_ptr<ManagedX509> cert,
+                  v8::Local<v8::Object> issuer_chain = v8::Local<v8::Object>());
+
+  // Like New(), but reads the issuer chain from issuer_chain[start] upward.
+  static v8::MaybeLocal<v8::Object> NewWithIssuers(
       Environment* env,
-      v8::Local<v8::Object> object,
       std::shared_ptr<ManagedX509> cert,
-      STACK_OF(X509)* issuer_chain = nullptr);
+      const STACK_OF(X509) * issuer_chain,
+      int start);
 
   std::shared_ptr<ManagedX509> cert_;
   BaseObjectPtr<X509Certificate> issuer_cert_;

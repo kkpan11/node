@@ -19,6 +19,10 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#ifdef NODE_BUNDLED_ZSTD
+#define ZSTD_STATIC_LINKING_ONLY
+#endif
+
 #include "memory_tracker-inl.h"
 #include "node.h"
 #include "node_buffer.h"
@@ -30,28 +34,34 @@
 #include "threadpoolwork-inl.h"
 #include "util-inl.h"
 
+#include "node_debug.h"
+#include "v8-fast-api-calls.h"
 #include "v8.h"
 
-#include "brotli/encode.h"
 #include "brotli/decode.h"
+#include "brotli/encode.h"
+#include "brotli/shared_dictionary.h"
 #include "zlib.h"
+#include "zstd.h"
+#include "zstd_errors.h"
 
 #include <sys/types.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <atomic>
+#include <optional>
 
 namespace node {
 
 using v8::ArrayBuffer;
+using v8::CFunction;
 using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
-using v8::Int32;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
@@ -95,6 +105,44 @@ inline const char* ZlibStrerror(int err) {
   return "Z_UNKNOWN_ERROR";
 }
 
+#define ZSTD_ERROR_CODES(V)                                                    \
+  V(ZSTD_error_no_error)                                                       \
+  V(ZSTD_error_GENERIC)                                                        \
+  V(ZSTD_error_prefix_unknown)                                                 \
+  V(ZSTD_error_version_unsupported)                                            \
+  V(ZSTD_error_frameParameter_unsupported)                                     \
+  V(ZSTD_error_frameParameter_windowTooLarge)                                  \
+  V(ZSTD_error_corruption_detected)                                            \
+  V(ZSTD_error_checksum_wrong)                                                 \
+  V(ZSTD_error_literals_headerWrong)                                           \
+  V(ZSTD_error_dictionary_corrupted)                                           \
+  V(ZSTD_error_dictionary_wrong)                                               \
+  V(ZSTD_error_dictionaryCreation_failed)                                      \
+  V(ZSTD_error_parameter_unsupported)                                          \
+  V(ZSTD_error_parameter_combination_unsupported)                              \
+  V(ZSTD_error_parameter_outOfBound)                                           \
+  V(ZSTD_error_tableLog_tooLarge)                                              \
+  V(ZSTD_error_maxSymbolValue_tooLarge)                                        \
+  V(ZSTD_error_maxSymbolValue_tooSmall)                                        \
+  V(ZSTD_error_stabilityCondition_notRespected)                                \
+  V(ZSTD_error_stage_wrong)                                                    \
+  V(ZSTD_error_init_missing)                                                   \
+  V(ZSTD_error_memory_allocation)                                              \
+  V(ZSTD_error_workSpace_tooSmall)                                             \
+  V(ZSTD_error_dstSize_tooSmall)                                               \
+  V(ZSTD_error_srcSize_wrong)                                                  \
+  V(ZSTD_error_dstBuffer_null)                                                 \
+  V(ZSTD_error_noForwardProgress_destFull)                                     \
+  V(ZSTD_error_noForwardProgress_inputEmpty)
+
+inline const char* ZstdStrerror(int err) {
+#define V(code)                                                                \
+  if (err == code) return #code;
+  ZSTD_ERROR_CODES(V)
+#undef V
+  return "ZSTD_error_GENERIC";
+}
+
 enum node_zlib_mode {
   NONE,
   DEFLATE,
@@ -105,7 +153,9 @@ enum node_zlib_mode {
   INFLATERAW,
   UNZIP,
   BROTLI_DECODE,
-  BROTLI_ENCODE
+  BROTLI_ENCODE,
+  ZSTD_COMPRESS,
+  ZSTD_DECOMPRESS
 };
 
 constexpr uint8_t GZIP_HEADER_ID1 = 0x1f;
@@ -143,9 +193,12 @@ class ZlibContext final : public MemoryRetainer {
   CompressionError ResetStream();
 
   // Zlib-specific:
-  void Init(int level, int window_bits, int mem_level, int strategy,
+  void Init(int level,
+            int window_bits,
+            int mem_level,
+            int strategy,
+            bool reject_garbage_after_end,
             std::vector<unsigned char>&& dictionary);
-  void SetAllocationFunctions(alloc_func alloc, free_func free, void* opaque);
   CompressionError SetParams(int level, int strategy);
 
   SET_MEMORY_INFO_NAME(ZlibContext)
@@ -172,6 +225,7 @@ class ZlibContext final : public MemoryRetainer {
   node_zlib_mode mode_ = NONE;
   int strategy_ = 0;
   int window_bits_ = 0;
+  bool reject_garbage_after_end_ = false;
   unsigned int gzip_id_bytes_read_ = 0;
   std::vector<unsigned char> dictionary_;
 
@@ -199,11 +253,6 @@ class BrotliContext : public MemoryRetainer {
   size_t avail_in_ = 0;
   size_t avail_out_ = 0;
   BrotliEncoderOperation flush_ = BROTLI_OPERATION_PROCESS;
-  // TODO(addaleax): These should not need to be stored here.
-  // This is currently only done this way to make implementing ResetStream()
-  // easier.
-  brotli_alloc_func alloc_ = nullptr;
-  brotli_free_func free_ = nullptr;
   void* alloc_opaque_ = nullptr;
 };
 
@@ -211,9 +260,7 @@ class BrotliEncoderContext final : public BrotliContext {
  public:
   void Close();
   void DoThreadPoolWork();
-  CompressionError Init(brotli_alloc_func alloc,
-                        brotli_free_func free,
-                        void* opaque);
+  CompressionError Init(std::vector<uint8_t>&& dictionary = {});
   CompressionError ResetStream();
   CompressionError SetParams(int key, uint32_t value);
   CompressionError GetErrorInfo() const;
@@ -225,15 +272,18 @@ class BrotliEncoderContext final : public BrotliContext {
  private:
   bool last_result_ = false;
   DeleteFnPtr<BrotliEncoderState, BrotliEncoderDestroyInstance> state_;
+  DeleteFnPtr<BrotliEncoderPreparedDictionary,
+              BrotliEncoderDestroyPreparedDictionary>
+      prepared_dictionary_;
+  // Dictionary data must remain valid while the prepared dictionary is alive.
+  std::vector<uint8_t> dictionary_;
 };
 
 class BrotliDecoderContext final : public BrotliContext {
  public:
   void Close();
   void DoThreadPoolWork();
-  CompressionError Init(brotli_alloc_func alloc,
-                        brotli_free_func free,
-                        void* opaque);
+  CompressionError Init(std::vector<uint8_t>&& dictionary = {});
   CompressionError ResetStream();
   CompressionError SetParams(int key, uint32_t value);
   CompressionError GetErrorInfo() const;
@@ -247,10 +297,159 @@ class BrotliDecoderContext final : public BrotliContext {
   BrotliDecoderErrorCode error_ = BROTLI_DECODER_NO_ERROR;
   std::string error_string_;
   DeleteFnPtr<BrotliDecoderState, BrotliDecoderDestroyInstance> state_;
+  // Dictionary data must remain valid for the lifetime of the decoder.
+  std::vector<uint8_t> dictionary_;
+};
+
+class ZstdContext : public MemoryRetainer {
+ public:
+  ZstdContext() = default;
+
+  // Streaming-related, should be available for all compression libraries:
+  void SetBuffers(const char* in, uint32_t in_len, char* out, uint32_t out_len);
+  void SetFlush(int flush);
+  void GetAfterWriteOffsets(uint32_t* avail_in, uint32_t* avail_out) const;
+  CompressionError GetErrorInfo() const;
+
+  ZstdContext(const ZstdContext&) = delete;
+  ZstdContext& operator=(const ZstdContext&) = delete;
+
+ protected:
+  ZSTD_EndDirective flush_ = ZSTD_e_continue;
+
+  ZSTD_inBuffer input_ = {nullptr, 0, 0};
+  ZSTD_outBuffer output_ = {nullptr, 0, 0};
+
+  ZSTD_ErrorCode error_ = ZSTD_error_no_error;
+  std::string error_string_;
+  std::string error_code_string_;
+};
+
+class ZstdCompressContext final : public ZstdContext {
+ public:
+  ZstdCompressContext() = default;
+
+  // Streaming-related, should be available for all compression libraries:
+  void Close();
+  void DoThreadPoolWork();
+  CompressionError ResetStream();
+
+  // Zstd specific:
+  CompressionError Init(uint64_t pledged_src_size,
+                        std::string_view dictionary = {},
+                        bool reject_garbage_after_end = false);
+  CompressionError SetParameter(int key, int value);
+
+  // Wrap ZSTD_freeCCtx to remove the return type.
+  static void FreeZstd(ZSTD_CCtx* cctx) { ZSTD_freeCCtx(cctx); }
+
+  SET_MEMORY_INFO_NAME(ZstdCompressContext)
+  SET_SELF_SIZE(ZstdCompressContext)
+  SET_NO_MEMORY_INFO()
+
+ private:
+  DeleteFnPtr<ZSTD_CCtx, ZstdCompressContext::FreeZstd> cctx_;
+
+  uint64_t pledged_src_size_ = ZSTD_CONTENTSIZE_UNKNOWN;
+  std::optional<uint64_t> consumed_src_size_;
+};
+
+class ZstdDecompressContext final : public ZstdContext {
+ public:
+  ZstdDecompressContext() = default;
+
+  // Streaming-related, should be available for all compression libraries:
+  void Close();
+  void DoThreadPoolWork();
+  CompressionError GetErrorInfo() const;
+  CompressionError ResetStream();
+
+  // Zstd specific:
+  CompressionError Init(uint64_t pledged_src_size,
+                        std::string_view dictionary = {},
+                        bool reject_garbage_after_end = false);
+
+  CompressionError SetParameter(int key, int value);
+
+  // Wrap ZSTD_freeDCtx to remove the return type.
+  static void FreeZstd(ZSTD_DCtx* dctx) { ZSTD_freeDCtx(dctx); }
+
+  SET_MEMORY_INFO_NAME(ZstdDecompressContext)
+  SET_SELF_SIZE(ZstdDecompressContext)
+  SET_NO_MEMORY_INFO()
+
+ private:
+  DeleteFnPtr<ZSTD_DCtx, ZstdDecompressContext::FreeZstd> dctx_;
+  bool frame_complete_ = false;
+  bool decoding_frame_after_complete_ = false;
+  bool reject_garbage_after_end_ = false;
+  bool ignoring_trailing_input_ = false;
+  size_t frame_prefix_size_ = 0;
+  uint8_t possible_frame_types_ = 0;
+};
+
+class CompressionStreamMemoryOwner {
+ public:
+  // Allocation functions provided to zlib itself. We store the real size of
+  // the allocated memory chunk just before the "payload" memory we return
+  // to zlib.
+  // Because we use zlib off the thread pool, we can not report memory directly
+  // to V8; rather, we first store it as "unreported" memory in a separate
+  // field and later report it back from the main thread.
+  static void* AllocForZlib(void* data, uInt items, uInt size) {
+    size_t real_size = MultiplyWithOverflowCheck(static_cast<size_t>(items),
+                                                 static_cast<size_t>(size));
+    return AllocForBrotli(data, real_size);
+  }
+
+  static constexpr size_t reserveSizeAndAlign =
+      std::max(sizeof(size_t), alignof(max_align_t));
+
+  static void* AllocForBrotli(void* data, size_t size) {
+    size += reserveSizeAndAlign;
+    CompressionStreamMemoryOwner* ctx =
+        static_cast<CompressionStreamMemoryOwner*>(data);
+    char* memory = UncheckedMalloc(size);
+    if (memory == nullptr) [[unlikely]] {
+      return nullptr;
+    }
+    *reinterpret_cast<size_t*>(memory) = size;
+    ctx->unreported_allocations_.fetch_add(size, std::memory_order_relaxed);
+    return memory + reserveSizeAndAlign;
+  }
+
+  static void FreeForZlib(void* data, void* pointer) {
+    if (pointer == nullptr) [[unlikely]] {
+      return;
+    }
+    CompressionStreamMemoryOwner* ctx =
+        static_cast<CompressionStreamMemoryOwner*>(data);
+    char* real_pointer = static_cast<char*>(pointer) - reserveSizeAndAlign;
+    size_t real_size = *reinterpret_cast<size_t*>(real_pointer);
+    ctx->unreported_allocations_.fetch_sub(real_size,
+                                           std::memory_order_relaxed);
+    free(real_pointer);
+  }
+
+  void* as_allocator_opaque_value() { return static_cast<void*>(this); }
+
+ protected:
+  ssize_t ComputeAdjustmentToExternalAllocatedMemory() {
+    ssize_t report =
+        unreported_allocations_.exchange(0, std::memory_order_relaxed);
+    CHECK_IMPLIES(report < 0, zlib_memory_ >= static_cast<size_t>(-report));
+    zlib_memory_ += report;
+    return report;
+  }
+
+  std::atomic<ssize_t> unreported_allocations_{0};
+  size_t zlib_memory_ = 0;
 };
 
 template <typename CompressionContext>
-class CompressionStream : public AsyncWrap, public ThreadPoolWork {
+class CompressionStream : public AsyncWrap,
+                          public ThreadPoolWork,
+                          protected CompressionStreamMemoryOwner {
  public:
   enum InternalFields {
     kCompressionStreamBaseField = AsyncWrap::kInternalFieldCount,
@@ -330,7 +529,9 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
       if (!args[2]->Uint32Value(context).To(&in_off)) return;
       if (!args[3]->Uint32Value(context).To(&in_len)) return;
 
-      CHECK(Buffer::IsWithinBounds(in_off, in_len, Buffer::Length(in_buf)));
+      if (!Buffer::IsWithinBounds(in_off, in_len, Buffer::Length(in_buf))) {
+        return THROW_ERR_OUT_OF_RANGE(env, "input buffer is out of bounds");
+      }
       in = Buffer::Data(in_buf) + in_off;
     }
 
@@ -338,7 +539,9 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
     Local<Object> out_buf = args[4].As<Object>();
     if (!args[5]->Uint32Value(context).To(&out_off)) return;
     if (!args[6]->Uint32Value(context).To(&out_len)) return;
-    CHECK(Buffer::IsWithinBounds(out_off, out_len, Buffer::Length(out_buf)));
+    if (!Buffer::IsWithinBounds(out_off, out_len, Buffer::Length(out_buf))) {
+      return THROW_ERR_OUT_OF_RANGE(env, "output buffer is out of bounds");
+    }
     out = Buffer::Data(out_buf) + out_off;
 
     CompressionStream* ctx;
@@ -458,6 +661,12 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
     CompressionStream* wrap;
     ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
 
+    if (wrap->write_in_progress_) {
+      wrap->env()->ThrowError(
+          "Cannot reset zlib stream while a write is in progress");
+      return;
+    }
+
     AllocScope alloc_scope(wrap);
     const CompressionError err = wrap->context()->ResetStream();
     if (err.IsError())
@@ -470,6 +679,19 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
                                 zlib_memory_ + unreported_allocations_);
   }
 
+  static void* AllocatorOpaquePointerForContext(CompressionContext* ctx) {
+    CompressionStream* self = ContainerOf(&CompressionStream::ctx_, ctx);
+    // There is nothing at the type level stopping someone from using this
+    // method with `ctx` being an argument that is not part of a
+    // CompressionStream. This check catches that potential discrepancy in debug
+    // builds. std::launder is necessary to keep the compiler from optimizing
+    // away the check in the (common) case that `CompressionContext` is a final
+    // class.
+    DCHECK_EQ(std::launder<MemoryRetainer>(&self->ctx_)->MemoryInfoName(),
+              CompressionContext{}.MemoryInfoName());
+    return self->as_allocator_opaque_value();
+  }
+
  protected:
   CompressionContext* context() { return &ctx_; }
 
@@ -479,49 +701,13 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
     init_done_ = true;
   }
 
-  // Allocation functions provided to zlib itself. We store the real size of
-  // the allocated memory chunk just before the "payload" memory we return
-  // to zlib.
-  // Because we use zlib off the thread pool, we can not report memory directly
-  // to V8; rather, we first store it as "unreported" memory in a separate
-  // field and later report it back from the main thread.
-  static void* AllocForZlib(void* data, uInt items, uInt size) {
-    size_t real_size =
-        MultiplyWithOverflowCheck(static_cast<size_t>(items),
-                                  static_cast<size_t>(size));
-    return AllocForBrotli(data, real_size);
-  }
-
-  static void* AllocForBrotli(void* data, size_t size) {
-    size += sizeof(size_t);
-    CompressionStream* ctx = static_cast<CompressionStream*>(data);
-    char* memory = UncheckedMalloc(size);
-    if (UNLIKELY(memory == nullptr)) return nullptr;
-    *reinterpret_cast<size_t*>(memory) = size;
-    ctx->unreported_allocations_.fetch_add(size,
-                                           std::memory_order_relaxed);
-    return memory + sizeof(size_t);
-  }
-
-  static void FreeForZlib(void* data, void* pointer) {
-    if (UNLIKELY(pointer == nullptr)) return;
-    CompressionStream* ctx = static_cast<CompressionStream*>(data);
-    char* real_pointer = static_cast<char*>(pointer) - sizeof(size_t);
-    size_t real_size = *reinterpret_cast<size_t*>(real_pointer);
-    ctx->unreported_allocations_.fetch_sub(real_size,
-                                           std::memory_order_relaxed);
-    free(real_pointer);
-  }
-
   // This is called on the main thread after zlib may have allocated something
   // in order to report it back to V8.
   void AdjustAmountOfExternalAllocatedMemory() {
-    ssize_t report =
-        unreported_allocations_.exchange(0, std::memory_order_relaxed);
+    ssize_t report = ComputeAdjustmentToExternalAllocatedMemory();
     if (report == 0) return;
-    CHECK_IMPLIES(report < 0, zlib_memory_ >= static_cast<size_t>(-report));
-    zlib_memory_ += report;
-    AsyncWrap::env()->isolate()->AdjustAmountOfExternalAllocatedMemory(report);
+    AsyncWrap::env()->external_memory_accounter()->Update(
+        AsyncWrap::env()->isolate(), report);
   }
 
   struct AllocScope {
@@ -550,8 +736,6 @@ class CompressionStream : public AsyncWrap, public ThreadPoolWork {
   bool closed_ = false;
   unsigned int refs_ = 0;
   uint32_t* write_result_ = nullptr;
-  std::atomic<ssize_t> unreported_allocations_{0};
-  size_t zlib_memory_ = 0;
 
   CompressionContext ctx_;
 };
@@ -566,8 +750,7 @@ class ZlibStream final : public CompressionStream<ZlibContext> {
   static void New(const FunctionCallbackInfo<Value>& args) {
     Environment* env = Environment::GetCurrent(args);
     CHECK(args[0]->IsInt32());
-    node_zlib_mode mode =
-        static_cast<node_zlib_mode>(args[0].As<Int32>()->Value());
+    node_zlib_mode mode = FromV8Value<node_zlib_mode>(args[0]);
     new ZlibStream(env, args.This(), mode);
   }
 
@@ -583,9 +766,10 @@ class ZlibStream final : public CompressionStream<ZlibContext> {
           "a version of npm (> 5.5.1 or < 5.4.0) or node-tar (> 4.0.1) "
           "that is compatible with Node.js 9 and above.\n");
     }
-    CHECK(args.Length() == 7 &&
-      "init(windowBits, level, memLevel, strategy, writeResult, writeCallback,"
-      " dictionary)");
+    CHECK((args.Length() == 7 || args.Length() == 8) &&
+          "init(windowBits, level, memLevel, strategy, writeResult, "
+          "writeCallback,"
+          " dictionary[, rejectGarbageAfterEnd])");
 
     ZlibStream* wrap;
     ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
@@ -609,6 +793,7 @@ class ZlibStream final : public CompressionStream<ZlibContext> {
 
     CHECK(args[4]->IsUint32Array());
     Local<Uint32Array> array = args[4].As<Uint32Array>();
+    CHECK_GE(array->Length(), 2);
     Local<ArrayBuffer> ab = array->Buffer();
     uint32_t* write_result = static_cast<uint32_t*>(ab->Data());
 
@@ -624,12 +809,20 @@ class ZlibStream final : public CompressionStream<ZlibContext> {
           data + Buffer::Length(args[6]));
     }
 
+    bool reject_garbage_after_end = false;
+    if (args.Length() == 8) {
+      CHECK(args[7]->IsBoolean());
+      reject_garbage_after_end = args[7]->IsTrue();
+    }
+
     wrap->InitStream(write_result, write_js_callback);
 
     AllocScope alloc_scope(wrap);
-    wrap->context()->SetAllocationFunctions(
-        AllocForZlib, FreeForZlib, static_cast<CompressionStream*>(wrap));
-    wrap->context()->Init(level, window_bits, mem_level, strategy,
+    wrap->context()->Init(level,
+                          window_bits,
+                          mem_level,
+                          strategy,
+                          reject_garbage_after_end,
                           std::move(dictionary));
   }
 
@@ -672,17 +865,18 @@ class BrotliCompressionStream final :
   static void New(const FunctionCallbackInfo<Value>& args) {
     Environment* env = Environment::GetCurrent(args);
     CHECK(args[0]->IsInt32());
-    node_zlib_mode mode =
-        static_cast<node_zlib_mode>(args[0].As<Int32>()->Value());
+    node_zlib_mode mode = FromV8Value<node_zlib_mode>(args[0]);
     new BrotliCompressionStream(env, args.This(), mode);
   }
 
   static void Init(const FunctionCallbackInfo<Value>& args) {
     BrotliCompressionStream* wrap;
     ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
-    CHECK(args.Length() == 3 && "init(params, writeResult, writeCallback)");
+    CHECK((args.Length() == 3 || args.Length() == 4) &&
+          "init(params, writeResult, writeCallback[, dictionary])");
 
     CHECK(args[1]->IsUint32Array());
+    CHECK_GE(args[1].As<Uint32Array>()->Length(), 2);
     uint32_t* write_result = reinterpret_cast<uint32_t*>(Buffer::Data(args[1]));
 
     CHECK(args[2]->IsFunction());
@@ -690,11 +884,18 @@ class BrotliCompressionStream final :
     wrap->InitStream(write_result, write_js_callback);
 
     AllocScope alloc_scope(wrap);
-    CompressionError err =
-        wrap->context()->Init(
-          CompressionStream<CompressionContext>::AllocForBrotli,
-          CompressionStream<CompressionContext>::FreeForZlib,
-          static_cast<CompressionStream<CompressionContext>*>(wrap));
+    std::vector<uint8_t> dictionary;
+    if (args.Length() == 4 && !args[3]->IsUndefined()) {
+      if (!args[3]->IsArrayBufferView()) {
+        THROW_ERR_INVALID_ARG_TYPE(
+            wrap->env(), "dictionary must be an ArrayBufferView if provided");
+        return;
+      }
+      ArrayBufferViewContents<uint8_t> contents(args[3]);
+      dictionary.assign(contents.data(), contents.data() + contents.length());
+    }
+
+    CompressionError err = wrap->context()->Init(std::move(dictionary));
     if (err.IsError()) {
       wrap->EmitError(err);
       // TODO(addaleax): Sometimes we generate better error codes in C++ land,
@@ -735,6 +936,116 @@ class BrotliCompressionStream final :
 
 using BrotliEncoderStream = BrotliCompressionStream<BrotliEncoderContext>;
 using BrotliDecoderStream = BrotliCompressionStream<BrotliDecoderContext>;
+
+template <typename CompressionContext>
+class ZstdStream final : public CompressionStream<CompressionContext> {
+ public:
+  ZstdStream(Environment* env, Local<Object> wrap)
+      : CompressionStream<CompressionContext>(env, wrap) {}
+
+  inline CompressionContext* context() {
+    return this->CompressionStream<CompressionContext>::context();
+  }
+  typedef typename CompressionStream<CompressionContext>::AllocScope AllocScope;
+
+  static void New(const FunctionCallbackInfo<Value>& args) {
+    Environment* env = Environment::GetCurrent(args);
+    new ZstdStream(env, args.This());
+  }
+
+  static void Init(const FunctionCallbackInfo<Value>& args) {
+    CHECK((args.Length() >= 4 && args.Length() <= 6) &&
+          "init(params, pledgedSrcSize, writeResult, writeCallback[, "
+          "dictionary[, rejectGarbageAfterEnd]])");
+
+    ZstdStream* wrap;
+    ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
+
+    CHECK(args[2]->IsUint32Array());
+    CHECK_GE(args[2].As<Uint32Array>()->Length(), 2);
+    uint32_t* write_result = reinterpret_cast<uint32_t*>(Buffer::Data(args[2]));
+
+    CHECK(args[3]->IsFunction());
+    Local<Function> write_js_callback = args[3].As<Function>();
+    wrap->InitStream(write_result, write_js_callback);
+
+    uint64_t pledged_src_size = ZSTD_CONTENTSIZE_UNKNOWN;
+    if (!args[1]->IsUndefined()) {
+      if (!args[1]->IsNumber()) {
+        THROW_ERR_INVALID_ARG_TYPE(wrap->env(),
+                                   "pledgedSrcSize must be a number");
+        return;
+      }
+      if (!IsSafeJsInt(args[1])) {
+        THROW_ERR_OUT_OF_RANGE(wrap->env(),
+                               "pledgedSrcSize must be a safe integer");
+        return;
+      }
+      const int64_t signed_pledged_src_size = args[1].As<Integer>()->Value();
+      if (signed_pledged_src_size < 0) {
+        THROW_ERR_OUT_OF_RANGE(wrap->env(),
+                               "pledgedSrcSize must be non-negative");
+        return;
+      }
+      pledged_src_size = static_cast<uint64_t>(signed_pledged_src_size);
+    }
+
+    AllocScope alloc_scope(wrap);
+    std::string_view dictionary;
+    ArrayBufferViewContents<char> contents;
+    if (args.Length() >= 5 && !args[4]->IsUndefined()) {
+      if (!args[4]->IsArrayBufferView()) {
+        THROW_ERR_INVALID_ARG_TYPE(
+            wrap->env(), "dictionary must be an ArrayBufferView if provided");
+        return;
+      }
+      contents.ReadValue(args[4]);
+      dictionary = std::string_view(contents.data(), contents.length());
+    }
+
+    bool reject_garbage_after_end = false;
+    if (args.Length() == 6) {
+      CHECK(args[5]->IsBoolean());
+      reject_garbage_after_end = args[5]->IsTrue();
+    }
+
+    CompressionError err = wrap->context()->Init(
+        pledged_src_size, dictionary, reject_garbage_after_end);
+    if (err.IsError()) {
+      wrap->EmitError(err);
+      THROW_ERR_ZLIB_INITIALIZATION_FAILED(wrap->env(), err.message);
+      return;
+    }
+
+    CHECK(args[0]->IsUint32Array());
+    const uint32_t* data = reinterpret_cast<uint32_t*>(Buffer::Data(args[0]));
+    size_t len = args[0].As<Uint32Array>()->Length();
+
+    for (int i = 0; static_cast<size_t>(i) < len; i++) {
+      if (data[i] == static_cast<uint32_t>(-1)) continue;
+
+      CompressionError err = wrap->context()->SetParameter(i, data[i]);
+      if (err.IsError()) {
+        wrap->EmitError(err);
+        THROW_ERR_ZLIB_INITIALIZATION_FAILED(wrap->env(), err.message);
+        return;
+      }
+    }
+  }
+
+  static void Params(const FunctionCallbackInfo<Value>& args) {
+    // Currently a no-op, and not accessed from JS land.
+    // At some point zstd may support changing parameters on the fly,
+    // in which case we can implement this and a JS equivalent similar to
+    // the zlib Params() function.
+  }
+
+  SET_MEMORY_INFO_NAME(ZstdStream)
+  SET_SELF_SIZE(ZstdStream)
+};
+
+using ZstdCompressStream = ZstdStream<ZstdCompressContext>;
+using ZstdDecompressStream = ZstdStream<ZstdDecompressContext>;
 
 void ZlibContext::Close() {
   {
@@ -850,10 +1161,8 @@ void ZlibContext::DoThreadPoolWork() {
         }
       }
 
-      while (strm_.avail_in > 0 &&
-             mode_ == GUNZIP &&
-             err_ == Z_STREAM_END &&
-             strm_.next_in[0] != 0x00) {
+      while (strm_.avail_in > 0 && mode_ == GUNZIP && err_ == Z_STREAM_END &&
+             !reject_garbage_after_end_ && strm_.next_in[0] != 0x00) {
         // Bytes remain in input buffer. Perhaps this is another compressed
         // member in the same archive, or just trailing garbage.
         // Trailing zero bytes are okay, though, since they are frequently
@@ -952,19 +1261,18 @@ CompressionError ZlibContext::ResetStream() {
   return SetDictionary();
 }
 
+void ZlibContext::Init(int level,
+                       int window_bits,
+                       int mem_level,
+                       int strategy,
+                       bool reject_garbage_after_end,
+                       std::vector<unsigned char>&& dictionary) {
+  // Set allocation functions
+  strm_.zalloc = CompressionStreamMemoryOwner::AllocForZlib;
+  strm_.zfree = CompressionStreamMemoryOwner::FreeForZlib;
+  strm_.opaque =
+      CompressionStream<ZlibContext>::AllocatorOpaquePointerForContext(this);
 
-void ZlibContext::SetAllocationFunctions(alloc_func alloc,
-                                         free_func free,
-                                         void* opaque) {
-  strm_.zalloc = alloc;
-  strm_.zfree = free;
-  strm_.opaque = opaque;
-}
-
-
-void ZlibContext::Init(
-    int level, int window_bits, int mem_level, int strategy,
-    std::vector<unsigned char>&& dictionary) {
   if (!((window_bits == 0) &&
         (mode_ == INFLATE ||
          mode_ == GUNZIP ||
@@ -989,6 +1297,7 @@ void ZlibContext::Init(
   window_bits_ = window_bits;
   mem_level_ = mem_level;
   strategy_ = strategy;
+  reject_garbage_after_end_ = reject_garbage_after_end;
 
   flush_ = Z_NO_FLUSH;
 
@@ -1014,6 +1323,11 @@ bool ZlibContext::InitZlib() {
   if (zlib_init_done_) {
     return false;
   }
+
+  // If deflateInit2() fails with Z_VERSION_ERROR, msg remains uninitialized.
+  // Initialize it here to avoid reading the uninitialized pointer during error
+  // emission.
+  strm_.msg = nullptr;
 
   switch (mode_) {
     case DEFLATE:
@@ -1143,27 +1457,61 @@ void BrotliEncoderContext::DoThreadPoolWork() {
 
 void BrotliEncoderContext::Close() {
   state_.reset();
+  prepared_dictionary_.reset();
+  dictionary_.clear();
   mode_ = NONE;
 }
 
-CompressionError BrotliEncoderContext::Init(brotli_alloc_func alloc,
-                                            brotli_free_func free,
-                                            void* opaque) {
-  alloc_ = alloc;
-  free_ = free;
-  alloc_opaque_ = opaque;
+CompressionError BrotliEncoderContext::Init(std::vector<uint8_t>&& dictionary) {
+  brotli_alloc_func alloc = CompressionStreamMemoryOwner::AllocForBrotli;
+  brotli_free_func free = CompressionStreamMemoryOwner::FreeForZlib;
+  void* opaque =
+      CompressionStream<BrotliEncoderContext>::AllocatorOpaquePointerForContext(
+          this);
+
+  // Clean up any previous dictionary state before re-initializing.
+  prepared_dictionary_.reset();
+  dictionary_.clear();
+
   state_.reset(BrotliEncoderCreateInstance(alloc, free, opaque));
   if (!state_) {
     return CompressionError("Could not initialize Brotli instance",
                             "ERR_ZLIB_INITIALIZATION_FAILED",
                             -1);
-  } else {
-    return CompressionError {};
   }
+
+  if (!dictionary.empty()) {
+    // The dictionary data must remain valid for the lifetime of the prepared
+    // dictionary, so take ownership via move.
+    dictionary_ = std::move(dictionary);
+
+    prepared_dictionary_.reset(
+        BrotliEncoderPrepareDictionary(BROTLI_SHARED_DICTIONARY_RAW,
+                                       dictionary_.size(),
+                                       dictionary_.data(),
+                                       BROTLI_MAX_QUALITY,
+                                       alloc,
+                                       free,
+                                       opaque));
+    if (!prepared_dictionary_) {
+      return CompressionError("Failed to prepare brotli dictionary",
+                              "ERR_ZLIB_DICTIONARY_LOAD_FAILED",
+                              -1);
+    }
+
+    if (!BrotliEncoderAttachPreparedDictionary(state_.get(),
+                                               prepared_dictionary_.get())) {
+      return CompressionError("Failed to attach brotli dictionary",
+                              "ERR_ZLIB_DICTIONARY_LOAD_FAILED",
+                              -1);
+    }
+  }
+
+  return CompressionError{};
 }
 
 CompressionError BrotliEncoderContext::ResetStream() {
-  return Init(alloc_, free_, alloc_opaque_);
+  return Init();
 }
 
 CompressionError BrotliEncoderContext::SetParams(int key, uint32_t value) {
@@ -1191,6 +1539,7 @@ CompressionError BrotliEncoderContext::GetErrorInfo() const {
 
 void BrotliDecoderContext::Close() {
   state_.reset();
+  dictionary_.clear();
   mode_ = NONE;
 }
 
@@ -1211,24 +1560,43 @@ void BrotliDecoderContext::DoThreadPoolWork() {
   }
 }
 
-CompressionError BrotliDecoderContext::Init(brotli_alloc_func alloc,
-                                            brotli_free_func free,
-                                            void* opaque) {
-  alloc_ = alloc;
-  free_ = free;
-  alloc_opaque_ = opaque;
+CompressionError BrotliDecoderContext::Init(std::vector<uint8_t>&& dictionary) {
+  brotli_alloc_func alloc = CompressionStreamMemoryOwner::AllocForBrotli;
+  brotli_free_func free = CompressionStreamMemoryOwner::FreeForZlib;
+  void* opaque =
+      CompressionStream<BrotliDecoderContext>::AllocatorOpaquePointerForContext(
+          this);
+
+  // Clean up any previous dictionary state before re-initializing.
+  dictionary_.clear();
+
   state_.reset(BrotliDecoderCreateInstance(alloc, free, opaque));
   if (!state_) {
     return CompressionError("Could not initialize Brotli instance",
                             "ERR_ZLIB_INITIALIZATION_FAILED",
                             -1);
-  } else {
-    return CompressionError {};
   }
+
+  if (!dictionary.empty()) {
+    // The dictionary data must remain valid for the lifetime of the decoder,
+    // so take ownership via move.
+    dictionary_ = std::move(dictionary);
+
+    if (!BrotliDecoderAttachDictionary(state_.get(),
+                                       BROTLI_SHARED_DICTIONARY_RAW,
+                                       dictionary_.size(),
+                                       dictionary_.data())) {
+      return CompressionError("Failed to attach brotli dictionary",
+                              "ERR_ZLIB_DICTIONARY_LOAD_FAILED",
+                              -1);
+    }
+  }
+
+  return CompressionError{};
 }
 
 CompressionError BrotliDecoderContext::ResetStream() {
-  return Init(alloc_, free_, alloc_opaque_);
+  return Init();
 }
 
 CompressionError BrotliDecoderContext::SetParams(int key, uint32_t value) {
@@ -1259,6 +1627,314 @@ CompressionError BrotliDecoderContext::GetErrorInfo() const {
   }
 }
 
+void ZstdContext::SetBuffers(const char* in,
+                             uint32_t in_len,
+                             char* out,
+                             uint32_t out_len) {
+  input_.src = reinterpret_cast<const uint8_t*>(in);
+  input_.size = in_len;
+  input_.pos = 0;
+
+  output_.dst = reinterpret_cast<uint8_t*>(out);
+  output_.size = out_len;
+  output_.pos = 0;
+}
+
+void ZstdContext::SetFlush(int flush) {
+  flush_ = static_cast<ZSTD_EndDirective>(flush);
+}
+
+void ZstdContext::GetAfterWriteOffsets(uint32_t* avail_in,
+                                       uint32_t* avail_out) const {
+  *avail_in = input_.size - input_.pos;
+  *avail_out = output_.size - output_.pos;
+}
+
+CompressionError ZstdContext::GetErrorInfo() const {
+  if (error_ != ZSTD_error_no_error) {
+    return CompressionError(error_string_.c_str(),
+                            error_code_string_.c_str(),
+                            static_cast<int>(error_));
+  } else {
+    return {};
+  }
+}
+
+CompressionError ZstdCompressContext::SetParameter(int key, int value) {
+  size_t result = ZSTD_CCtx_setParameter(
+      cctx_.get(), static_cast<ZSTD_cParameter>(key), value);
+  if (ZSTD_isError(result)) {
+    return CompressionError(
+        "Setting parameter failed", "ERR_ZSTD_PARAM_SET_FAILED", -1);
+  }
+  return {};
+}
+
+void ZstdCompressContext::Close() {
+  cctx_.reset();
+}
+
+CompressionError ZstdCompressContext::Init(uint64_t pledged_src_size,
+                                           std::string_view dictionary,
+                                           bool) {
+  pledged_src_size_ = pledged_src_size;
+  if (pledged_src_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+    consumed_src_size_.reset();
+  } else {
+    consumed_src_size_ = 0;
+  }
+#ifdef NODE_BUNDLED_ZSTD
+  ZSTD_customMem custom_mem = {
+      CompressionStreamMemoryOwner::AllocForBrotli,
+      CompressionStreamMemoryOwner::FreeForZlib,
+      CompressionStream<ZstdCompressContext>::AllocatorOpaquePointerForContext(
+          this)};
+  cctx_.reset(ZSTD_createCCtx_advanced(custom_mem));
+#else
+  cctx_.reset(ZSTD_createCCtx());
+#endif
+  if (!cctx_) {
+    return CompressionError("Could not initialize zstd instance",
+                            "ERR_ZLIB_INITIALIZATION_FAILED",
+                            -1);
+  }
+
+  if (!dictionary.empty()) {
+    size_t ret = ZSTD_CCtx_loadDictionary(
+        cctx_.get(), dictionary.data(), dictionary.size());
+    if (ZSTD_isError(ret)) {
+      return CompressionError("Failed to load zstd dictionary",
+                              "ERR_ZLIB_DICTIONARY_LOAD_FAILED",
+                              -1);
+    }
+  }
+
+  size_t result = ZSTD_CCtx_setPledgedSrcSize(cctx_.get(), pledged_src_size);
+  if (ZSTD_isError(result)) {
+    return CompressionError(
+        "Could not set pledged src size", "ERR_ZLIB_INITIALIZATION_FAILED", -1);
+  }
+  return {};
+}
+
+CompressionError ZstdCompressContext::ResetStream() {
+  size_t result = ZSTD_CCtx_reset(cctx_.get(), ZSTD_reset_session_only);
+  if (ZSTD_isError(result)) {
+    const ZSTD_ErrorCode error = ZSTD_getErrorCode(result);
+    return CompressionError(
+        ZSTD_getErrorString(error), ZstdStrerror(error), error);
+  }
+
+  result = ZSTD_CCtx_setPledgedSrcSize(cctx_.get(), pledged_src_size_);
+  if (ZSTD_isError(result)) {
+    const ZSTD_ErrorCode error = ZSTD_getErrorCode(result);
+    return CompressionError(
+        ZSTD_getErrorString(error), ZstdStrerror(error), error);
+  }
+
+  if (pledged_src_size_ == ZSTD_CONTENTSIZE_UNKNOWN) {
+    consumed_src_size_.reset();
+  } else {
+    consumed_src_size_ = 0;
+  }
+  error_ = ZSTD_error_no_error;
+  error_string_.clear();
+  error_code_string_.clear();
+  return {};
+}
+
+void ZstdCompressContext::DoThreadPoolWork() {
+  // Zstd overrides a configured pledge when the first call uses ZSTD_e_end.
+  size_t const input_pos = input_.pos;
+  size_t const remaining =
+      ZSTD_compressStream2(cctx_.get(), &output_, &input_, flush_);
+  if (consumed_src_size_.has_value()) {
+    *consumed_src_size_ += input_.pos - input_pos;
+  }
+  if (ZSTD_isError(remaining)) {
+    error_ = ZSTD_getErrorCode(remaining);
+    error_code_string_ = ZstdStrerror(error_);
+    error_string_ = ZSTD_getErrorString(error_);
+  } else if (remaining == 0 && flush_ == ZSTD_e_end &&
+             consumed_src_size_.has_value()) {
+    uint64_t const consumed_src_size = *consumed_src_size_;
+    consumed_src_size_.reset();
+    if (consumed_src_size != pledged_src_size_) {
+      error_ = ZSTD_error_srcSize_wrong;
+      error_code_string_ = ZstdStrerror(error_);
+      error_string_ = ZSTD_getErrorString(error_);
+    }
+  }
+}
+
+CompressionError ZstdDecompressContext::SetParameter(int key, int value) {
+  size_t result = ZSTD_DCtx_setParameter(
+      dctx_.get(), static_cast<ZSTD_dParameter>(key), value);
+  if (ZSTD_isError(result)) {
+    return CompressionError(
+        "Setting parameter failed", "ERR_ZSTD_PARAM_SET_FAILED", -1);
+  }
+  return {};
+}
+
+void ZstdDecompressContext::Close() {
+  dctx_.reset();
+}
+
+CompressionError ZstdDecompressContext::Init(uint64_t pledged_src_size,
+                                             std::string_view dictionary,
+                                             bool reject_garbage_after_end) {
+  frame_complete_ = false;
+  decoding_frame_after_complete_ = false;
+  reject_garbage_after_end_ = reject_garbage_after_end;
+  ignoring_trailing_input_ = false;
+  frame_prefix_size_ = 0;
+  possible_frame_types_ = 0;
+
+#ifdef NODE_BUNDLED_ZSTD
+  ZSTD_customMem custom_mem = {
+      CompressionStreamMemoryOwner::AllocForBrotli,
+      CompressionStreamMemoryOwner::FreeForZlib,
+      CompressionStream<
+          ZstdDecompressContext>::AllocatorOpaquePointerForContext(this)};
+  dctx_.reset(ZSTD_createDCtx_advanced(custom_mem));
+#else
+  dctx_.reset(ZSTD_createDCtx());
+#endif
+  if (!dctx_) {
+    return CompressionError("Could not initialize zstd instance",
+                            "ERR_ZLIB_INITIALIZATION_FAILED",
+                            -1);
+  }
+
+  if (!dictionary.empty()) {
+    size_t ret = ZSTD_DCtx_loadDictionary(
+        dctx_.get(), dictionary.data(), dictionary.size());
+    if (ZSTD_isError(ret)) {
+      return CompressionError("Failed to load zstd dictionary",
+                              "ERR_ZLIB_DICTIONARY_LOAD_FAILED",
+                              -1);
+    }
+  }
+  return {};
+}
+
+CompressionError ZstdDecompressContext::ResetStream() {
+  const size_t result = ZSTD_DCtx_reset(dctx_.get(), ZSTD_reset_session_only);
+  if (ZSTD_isError(result)) {
+    const ZSTD_ErrorCode error = ZSTD_getErrorCode(result);
+    return CompressionError(
+        ZSTD_getErrorString(error), ZstdStrerror(error), error);
+  }
+
+  frame_complete_ = false;
+  decoding_frame_after_complete_ = false;
+  ignoring_trailing_input_ = false;
+  frame_prefix_size_ = 0;
+  possible_frame_types_ = 0;
+  error_ = ZSTD_error_no_error;
+  error_string_.clear();
+  error_code_string_.clear();
+  return {};
+}
+
+void ZstdDecompressContext::DoThreadPoolWork() {
+  if (ignoring_trailing_input_) {
+    return;
+  }
+
+  // The JavaScript processing loop retries with an empty input buffer when the
+  // previous call filled the output buffer. Avoid interpreting that retry as
+  // the beginning of a new, incomplete frame.
+  if (frame_complete_ && input_.size == 0) {
+    return;
+  }
+
+  do {
+    if (frame_complete_) {
+      decoding_frame_after_complete_ = true;
+      frame_prefix_size_ = 0;
+      possible_frame_types_ = 0b11;
+    }
+
+    if (decoding_frame_after_complete_ && frame_prefix_size_ < 4) {
+      static constexpr uint8_t zstd_magic[] = {0x28, 0xb5, 0x2f, 0xfd};
+      static constexpr uint8_t skippable_magic[] = {0x50, 0x2a, 0x4d, 0x18};
+      const auto* data = static_cast<const uint8_t*>(input_.src);
+      size_t input_prefix_offset = 0;
+
+      while (frame_prefix_size_ < 4 &&
+             input_.pos + input_prefix_offset < input_.size) {
+        const size_t index = frame_prefix_size_;
+        const uint8_t byte = data[input_.pos + input_prefix_offset];
+        if (byte != zstd_magic[index]) {
+          possible_frame_types_ &= ~0b01;
+        }
+        if ((index == 0 && (byte & 0xf0) != skippable_magic[0]) ||
+            (index != 0 && byte != skippable_magic[index])) {
+          possible_frame_types_ &= ~0b10;
+        }
+        frame_prefix_size_++;
+        input_prefix_offset++;
+      }
+
+      if (possible_frame_types_ == 0) {
+        frame_complete_ = true;
+        decoding_frame_after_complete_ = false;
+        if (reject_garbage_after_end_) {
+          error_ = ZSTD_error_GENERIC;
+          error_code_string_ = "ERR_TRAILING_JUNK_AFTER_STREAM_END";
+          error_string_ =
+              "Trailing junk found after the end of the compressed stream";
+        } else {
+          ignoring_trailing_input_ = true;
+        }
+        return;
+      }
+    }
+
+    const size_t ret = ZSTD_decompressStream(dctx_.get(), &output_, &input_);
+    if (ZSTD_isError(ret)) {
+      frame_complete_ = false;
+      error_ = ZSTD_getErrorCode(ret);
+      error_code_string_ = ZstdStrerror(error_);
+      error_string_ = ZSTD_getErrorString(error_);
+      return;
+    }
+
+    frame_complete_ = ret == 0;
+    if (frame_complete_) {
+      decoding_frame_after_complete_ = false;
+    }
+  } while (frame_complete_ && input_.pos < input_.size &&
+           output_.pos < output_.size);
+}
+
+CompressionError ZstdDecompressContext::GetErrorInfo() const {
+  CompressionError error = ZstdContext::GetErrorInfo();
+  if (error.IsError()) {
+    return error;
+  }
+
+  if (flush_ == ZSTD_e_end && !frame_complete_ && input_.pos == input_.size &&
+      output_.pos < output_.size) {
+    if (decoding_frame_after_complete_) {
+      if (frame_prefix_size_ < 4) {
+        if (reject_garbage_after_end_) {
+          return CompressionError(
+              "Trailing junk found after the end of the compressed stream",
+              "ERR_TRAILING_JUNK_AFTER_STREAM_END",
+              -1);
+        }
+        return {};
+      }
+    }
+    return CompressionError(
+        "unexpected end of file", "Z_BUF_ERROR", Z_BUF_ERROR);
+  }
+
+  return {};
+}
 
 template <typename Stream>
 struct MakeClass {
@@ -1303,21 +1979,35 @@ T CallOnSequence(v8::Isolate* isolate, Local<Value> value, F callback) {
   }
 }
 
-// TODO(joyeecheung): use fast API
+static inline uint32_t CRC32Impl(Isolate* isolate,
+                                 Local<Value> data,
+                                 uint32_t value) {
+  return CallOnSequence<uint32_t>(
+      isolate, data, [&](const char* ptr, size_t size) -> uint32_t {
+        return static_cast<uint32_t>(
+            crc32(value, reinterpret_cast<const Bytef*>(ptr), size));
+      });
+}
+
 static void CRC32(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[0]->IsArrayBufferView() || args[0]->IsString());
   CHECK(args[1]->IsUint32());
   uint32_t value = args[1].As<v8::Uint32>()->Value();
-
-  uint32_t result = CallOnSequence<uint32_t>(
-      args.GetIsolate(),
-      args[0],
-      [&](const char* data, size_t size) -> uint32_t {
-        return crc32(value, reinterpret_cast<const Bytef*>(data), size);
-      });
-
-  args.GetReturnValue().Set(result);
+  args.GetReturnValue().Set(CRC32Impl(args.GetIsolate(), args[0], value));
 }
+
+static uint32_t FastCRC32(v8::Local<v8::Value> receiver,
+                          v8::Local<v8::Value> data,
+                          uint32_t value,
+                          // NOLINTNEXTLINE(runtime/references)
+                          v8::FastApiCallbackOptions& options) {
+  TRACK_V8_FAST_API_CALL("zlib.crc32");
+  v8::HandleScope handle_scope(options.isolate);
+  CHECK(data->IsArrayBufferView() || data->IsString());
+  return CRC32Impl(options.isolate, data, value);
+}
+
+static CFunction fast_crc32_(CFunction::Make(FastCRC32));
 
 void Initialize(Local<Object> target,
                 Local<Value> unused,
@@ -1328,8 +2018,10 @@ void Initialize(Local<Object> target,
   MakeClass<ZlibStream>::Make(env, target, "Zlib");
   MakeClass<BrotliEncoderStream>::Make(env, target, "BrotliEncoder");
   MakeClass<BrotliDecoderStream>::Make(env, target, "BrotliDecoder");
+  MakeClass<ZstdCompressStream>::Make(env, target, "ZstdCompress");
+  MakeClass<ZstdDecompressStream>::Make(env, target, "ZstdDecompress");
 
-  SetMethod(context, target, "crc32", CRC32);
+  SetFastMethodNoSideEffect(context, target, "crc32", CRC32, &fast_crc32_);
   target->Set(env->context(),
               FIXED_ONE_BYTE_STRING(env->isolate(), "ZLIB_VERSION"),
               FIXED_ONE_BYTE_STRING(env->isolate(), ZLIB_VERSION)).Check();
@@ -1339,7 +2031,10 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   MakeClass<ZlibStream>::Make(registry);
   MakeClass<BrotliEncoderStream>::Make(registry);
   MakeClass<BrotliDecoderStream>::Make(registry);
+  MakeClass<ZstdCompressStream>::Make(registry);
+  MakeClass<ZstdDecompressStream>::Make(registry);
   registry->Register(CRC32);
+  registry->Register(fast_crc32_);
 }
 
 }  // anonymous namespace
@@ -1383,6 +2078,8 @@ void DefineZlibConstants(Local<Object> target) {
   NODE_DEFINE_CONSTANT(target, UNZIP);
   NODE_DEFINE_CONSTANT(target, BROTLI_DECODE);
   NODE_DEFINE_CONSTANT(target, BROTLI_ENCODE);
+  NODE_DEFINE_CONSTANT(target, ZSTD_DECOMPRESS);
+  NODE_DEFINE_CONSTANT(target, ZSTD_COMPRESS);
 
   NODE_DEFINE_CONSTANT(target, Z_MIN_WINDOWBITS);
   NODE_DEFINE_CONSTANT(target, Z_MAX_WINDOWBITS);
@@ -1462,6 +2159,70 @@ void DefineZlibConstants(Local<Object> target) {
   NODE_DEFINE_CONSTANT(target, BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_2);
   NODE_DEFINE_CONSTANT(target, BROTLI_DECODER_ERROR_ALLOC_BLOCK_TYPE_TREES);
   NODE_DEFINE_CONSTANT(target, BROTLI_DECODER_ERROR_UNREACHABLE);
+
+  // Zstd constants
+  NODE_DEFINE_CONSTANT(target, ZSTD_e_continue);
+  NODE_DEFINE_CONSTANT(target, ZSTD_e_flush);
+  NODE_DEFINE_CONSTANT(target, ZSTD_e_end);
+  NODE_DEFINE_CONSTANT(target, ZSTD_fast);
+  NODE_DEFINE_CONSTANT(target, ZSTD_dfast);
+  NODE_DEFINE_CONSTANT(target, ZSTD_greedy);
+  NODE_DEFINE_CONSTANT(target, ZSTD_lazy);
+  NODE_DEFINE_CONSTANT(target, ZSTD_lazy2);
+  NODE_DEFINE_CONSTANT(target, ZSTD_btlazy2);
+  NODE_DEFINE_CONSTANT(target, ZSTD_btopt);
+  NODE_DEFINE_CONSTANT(target, ZSTD_btultra);
+  NODE_DEFINE_CONSTANT(target, ZSTD_btultra2);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_compressionLevel);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_windowLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_hashLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_chainLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_searchLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_minMatch);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_targetLength);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_strategy);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_enableLongDistanceMatching);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_ldmHashLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_ldmMinMatch);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_ldmBucketSizeLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_ldmHashRateLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_contentSizeFlag);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_checksumFlag);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_dictIDFlag);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_nbWorkers);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_jobSize);
+  NODE_DEFINE_CONSTANT(target, ZSTD_c_overlapLog);
+  NODE_DEFINE_CONSTANT(target, ZSTD_d_windowLogMax);
+  NODE_DEFINE_CONSTANT(target, ZSTD_CLEVEL_DEFAULT);
+  // Error codes
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_no_error);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_GENERIC);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_prefix_unknown);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_version_unsupported);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_frameParameter_unsupported);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_frameParameter_windowTooLarge);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_corruption_detected);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_checksum_wrong);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_literals_headerWrong);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_dictionary_corrupted);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_dictionary_wrong);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_dictionaryCreation_failed);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_parameter_unsupported);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_parameter_combination_unsupported);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_parameter_outOfBound);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_tableLog_tooLarge);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_maxSymbolValue_tooLarge);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_maxSymbolValue_tooSmall);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_stabilityCondition_notRespected);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_stage_wrong);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_init_missing);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_memory_allocation);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_workSpace_tooSmall);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_dstSize_tooSmall);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_srcSize_wrong);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_dstBuffer_null);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_noForwardProgress_destFull);
+  NODE_DEFINE_CONSTANT(target, ZSTD_error_noForwardProgress_inputEmpty);
 }
 
 }  // namespace node

@@ -56,7 +56,12 @@ PerformanceState::PerformanceState(Isolate* isolate,
                 offsetof(performance_state_internal, observers),
                 NODE_PERFORMANCE_ENTRY_TYPE_INVALID,
                 root,
-                MAYBE_FIELD_PTR(info, observers)) {
+                MAYBE_FIELD_PTR(info, observers)),
+      uv_metrics(isolate,
+                 offsetof(performance_state_internal, uv_metrics),
+                 3,
+                 root,
+                 MAYBE_FIELD_PTR(info, uv_metrics)) {
   if (info == nullptr) {
     // For performance states initialized from scratch, reset
     // all the milestones and initialize the time origin.
@@ -80,9 +85,15 @@ PerformanceState::SerializeInfo PerformanceState::Serialize(
   // We'll re-initialize them after deserialization.
   ResetMilestones();
 
+  // Do not retain runtime metrics in the snapshot.
+  for (size_t i = 0; i < uv_metrics.Length(); ++i) {
+    uv_metrics[i] = 0;
+  }
+
   SerializeInfo info{root.Serialize(context, creator),
                      milestones.Serialize(context, creator),
-                     observers.Serialize(context, creator)};
+                     observers.Serialize(context, creator),
+                     uv_metrics.Serialize(context, creator)};
   return info;
 }
 
@@ -104,6 +115,7 @@ void PerformanceState::Deserialize(v8::Local<v8::Context> context,
   root.Deserialize(context);
   milestones.Deserialize(context);
   observers.Deserialize(context);
+  uv_metrics.Deserialize(context);
 
   // Re-initialize the time origin and timestamp i.e. the process start time.
   Initialize(time_origin, time_origin_timestamp);
@@ -115,6 +127,7 @@ std::ostream& operator<<(std::ostream& o,
     << "  " << i.root << ",  // root\n"
     << "  " << i.milestones << ",  // milestones\n"
     << "  " << i.observers << ",  // observers\n"
+    << "  " << i.uv_metrics << ",  // uv_metrics\n"
     << "}";
   return o;
 }
@@ -190,8 +203,9 @@ void MarkGarbageCollectionEnd(
   }
   env->performance_state()->current_gc_type = 0;
   // If no one is listening to gc performance entries, do not create them.
-  if (LIKELY(!state->observers[NODE_PERFORMANCE_ENTRY_TYPE_GC]))
+  if (!state->observers[NODE_PERFORMANCE_ENTRY_TYPE_GC]) [[likely]] {
     return;
+  }
 
   double start_time =
       (state->performance_last_gc_start_mark - env->time_origin()) /
@@ -264,31 +278,24 @@ void LoopIdleTime(const FunctionCallbackInfo<Value>& args) {
 void UvMetricsInfo(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   uv_metrics_t metrics;
-
   // uv_metrics_info always return 0
   CHECK_EQ(uv_metrics_info(env->event_loop(), &metrics), 0);
-
-  Local<Object> obj = Object::New(env->isolate());
-  obj->Set(env->context(),
-           env->loop_count(),
-           Integer::NewFromUnsigned(env->isolate(), metrics.loop_count))
-      .Check();
-  obj->Set(env->context(),
-           env->events(),
-           Integer::NewFromUnsigned(env->isolate(), metrics.events))
-      .Check();
-  obj->Set(env->context(),
-           env->events_waiting(),
-           Integer::NewFromUnsigned(env->isolate(), metrics.events_waiting))
-      .Check();
-
-  args.GetReturnValue().Set(obj);
+  AliasedInt32Array& buffer = env->performance_state()->uv_metrics;
+  buffer[0] = static_cast<int32_t>(metrics.loop_count);
+  buffer[1] = static_cast<int32_t>(metrics.events);
+  buffer[2] = static_cast<int32_t>(metrics.events_waiting);
 }
 
 void CreateELDHistogram(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   int64_t interval = args[0].As<Integer>()->Value();
   CHECK_GT(interval, 0);
+  if (args[1]->IsTrue()) {
+    BaseObjectPtr<IterationHistogram> histogram =
+        IterationHistogram::Create(env, Histogram::Options{1});
+    args.GetReturnValue().Set(histogram->object());
+    return;
+  }
   BaseObjectPtr<IntervalHistogram> histogram =
       IntervalHistogram::Create(env, interval, [](Histogram& histogram) {
         uint64_t delta = histogram.RecordDelta();
@@ -334,6 +341,7 @@ static void CreatePerIsolateProperties(IsolateData* isolate_data,
   Isolate* isolate = isolate_data->isolate();
 
   HistogramBase::Initialize(isolate_data, target);
+  SlidingWindowHistogram::Initialize(isolate_data, target);
 
   SetMethod(isolate, target, "setupObservers", SetupPerformanceObservers);
   SetMethod(isolate,
@@ -367,11 +375,17 @@ void CreatePerContextProperties(Local<Object> target,
   target->Set(context,
               FIXED_ONE_BYTE_STRING(isolate, "milestones"),
               state->milestones.GetJSArray()).Check();
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(isolate, "uvMetricsBuffer"),
+            state->uv_metrics.GetJSArray())
+      .Check();
 
   Local<Object> constants = Object::New(isolate);
 
   NODE_DEFINE_CONSTANT(constants, NODE_PERFORMANCE_GC_MAJOR);
   NODE_DEFINE_CONSTANT(constants, NODE_PERFORMANCE_GC_MINOR);
+  NODE_DEFINE_CONSTANT(constants, NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP);
   NODE_DEFINE_CONSTANT(constants, NODE_PERFORMANCE_GC_INCREMENTAL);
   NODE_DEFINE_CONSTANT(constants, NODE_PERFORMANCE_GC_WEAKCB);
 
@@ -417,10 +431,11 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(MarkBootstrapComplete);
   registry->Register(UvMetricsInfo);
   registry->Register(SlowPerformanceNow);
-  registry->Register(FastPerformanceNow);
-  registry->Register(fast_performance_now.GetTypeInfo());
+  registry->Register(fast_performance_now);
   HistogramBase::RegisterExternalReferences(registry);
+  SlidingWindowHistogram::RegisterExternalReferences(registry);
   IntervalHistogram::RegisterExternalReferences(registry);
+  IterationHistogram::RegisterExternalReferences(registry);
 }
 }  // namespace performance
 }  // namespace node

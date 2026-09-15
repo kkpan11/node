@@ -15,13 +15,22 @@
 
 namespace node {
 
+using ncrypto::BignumPointer;
+using ncrypto::BIOPointer;
+using ncrypto::ClearErrorOnReturn;
+using ncrypto::DataPointer;
+using ncrypto::Digest;
+using ncrypto::SSLPointer;
+using ncrypto::X509Name;
+using ncrypto::X509Pointer;
+using ncrypto::X509View;
 using v8::Array;
 using v8::ArrayBuffer;
 using v8::ArrayBufferView;
-using v8::BackingStore;
 using v8::Boolean;
 using v8::Context;
 using v8::Date;
+using v8::DictionaryTemplate;
 using v8::EscapableHandleScope;
 using v8::Function;
 using v8::FunctionCallbackInfo;
@@ -29,11 +38,14 @@ using v8::FunctionTemplate;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::LocalVector;
 using v8::MaybeLocal;
 using v8::NewStringType;
+using v8::Null;
 using v8::Object;
 using v8::String;
 using v8::Uint32;
+using v8::Undefined;
 using v8::Value;
 
 namespace crypto {
@@ -46,66 +58,56 @@ ManagedX509::ManagedX509(const ManagedX509& that) {
 
 ManagedX509& ManagedX509::operator=(const ManagedX509& that) {
   cert_.reset(that.get());
-
-  if (cert_)
+  if (cert_) [[likely]]
     X509_up_ref(cert_.get());
-
   return *this;
 }
 
 void ManagedX509::MemoryInfo(MemoryTracker* tracker) const {
+  if (!cert_) return;
   // This is an approximation based on the der encoding size.
   int size = i2d_X509(cert_.get(), nullptr);
   tracker->TrackFieldWithSize("cert", size);
 }
 
 namespace {
-void AddFingerprintDigest(const unsigned char* md,
-                          unsigned int md_size,
-                          char fingerprint[3 * EVP_MAX_MD_SIZE]) {
-  unsigned int i;
-  static constexpr char hex[] = "0123456789ABCDEF";
-
-  for (i = 0; i < md_size; i++) {
-    fingerprint[3 * i] = hex[(md[i] & 0xf0) >> 4];
-    fingerprint[(3 * i) + 1] = hex[(md[i] & 0x0f)];
-    fingerprint[(3 * i) + 2] = ':';
-  }
-
-  DCHECK_GT(md_size, 0);
-  fingerprint[(3 * (md_size - 1)) + 2] = '\0';
-}
-
 MaybeLocal<Value> GetFingerprintDigest(Environment* env,
-                                       const EVP_MD* method,
-                                       const ncrypto::X509View& cert) {
-  unsigned char md[EVP_MAX_MD_SIZE];
-  unsigned int md_size;
-  char fingerprint[EVP_MAX_MD_SIZE * 3];
-
-  if (X509_digest(cert.get(), method, md, &md_size)) {
-    AddFingerprintDigest(md, md_size, fingerprint);
-    return OneByteString(env->isolate(), fingerprint);
+                                       const Digest& method,
+                                       const X509View& cert) {
+  auto fingerprint = cert.getFingerprint(method);
+  // Returning an empty string indicates that the digest failed for
+  // some reason.
+  if (!fingerprint.has_value()) [[unlikely]] {
+    return Undefined(env->isolate());
   }
-  return Undefined(env->isolate());
+  auto& fp = fingerprint.value();
+  return OneByteString(env->isolate(), fp.data(), fp.length());
 }
 
-template <const EVP_MD* (*algo)()>
+template <const ncrypto::Digest& algo>
 void Fingerprint(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   X509Certificate* cert;
   ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
   Local<Value> ret;
-  if (GetFingerprintDigest(env, algo(), cert->view()).ToLocal(&ret)) {
+  if (GetFingerprintDigest(env, algo, cert->view()).ToLocal(&ret)) {
     args.GetReturnValue().Set(ret);
   }
 }
 
+MaybeLocal<String> ToV8Value(Environment* env, std::string_view val) {
+  return String::NewFromUtf8(
+      env->isolate(), val.data(), NewStringType::kNormal, val.size());
+}
+
 MaybeLocal<Value> ToV8Value(Local<Context> context, BIOPointer&& bio) {
-  if (!bio) return {};
+  if (!bio) [[unlikely]]
+    return {};
   BUF_MEM* mem = bio;
+  if (!mem) [[unlikely]]
+    return {};
   Local<Value> ret;
-  if (!String::NewFromUtf8(context->GetIsolate(),
+  if (!String::NewFromUtf8(Isolate::GetCurrent(),
                            mem->data,
                            NewStringType::kNormal,
                            mem->length)
@@ -114,56 +116,14 @@ MaybeLocal<Value> ToV8Value(Local<Context> context, BIOPointer&& bio) {
   return ret;
 }
 
-MaybeLocal<Value> ToV8Value(Local<Context> context, const ASN1_OBJECT* obj) {
-  // If OpenSSL knows the type, use the short name of the type as the key, and
-  // the numeric representation of the type's OID otherwise.
-  int nid = OBJ_obj2nid(obj);
-  char buf[80];
-  const char* str;
-  if (nid != NID_undef) {
-    str = OBJ_nid2sn(nid);
-    CHECK_NOT_NULL(str);
-  } else {
-    OBJ_obj2txt(buf, sizeof(buf), obj, true);
-    str = buf;
-  }
-
-  Local<Value> result;
-  if (!String::NewFromUtf8(context->GetIsolate(), str).ToLocal(&result)) {
-    return {};
-  }
-  return result;
-}
-
-MaybeLocal<Value> ToV8Value(Local<Context> context, const ASN1_STRING* str) {
-  // The previous implementation used X509_NAME_print_ex, which escapes some
-  // characters in the value. The old implementation did not decode/unescape
-  // values correctly though, leading to ambiguous and incorrect
-  // representations. The new implementation only converts to Unicode and does
-  // not escape anything.
-  unsigned char* value_str;
-  int value_str_size = ASN1_STRING_to_UTF8(&value_str, str);
-  if (value_str_size < 0) {
-    return Undefined(context->GetIsolate());
-  }
-  ncrypto::DataPointer free_value_str(value_str, value_str_size);
-
-  Local<Value> result;
-  if (!String::NewFromUtf8(context->GetIsolate(),
-                           reinterpret_cast<const char*>(value_str),
-                           NewStringType::kNormal,
-                           value_str_size)
-           .ToLocal(&result)) {
-    return {};
-  }
-  return result;
-}
-
 MaybeLocal<Value> ToV8Value(Local<Context> context, const BIOPointer& bio) {
-  if (!bio) return {};
+  if (!bio) [[unlikely]]
+    return {};
   BUF_MEM* mem = bio;
+  if (!mem) [[unlikely]]
+    return {};
   Local<Value> ret;
-  if (!String::NewFromUtf8(context->GetIsolate(),
+  if (!String::NewFromUtf8(Isolate::GetCurrent(),
                            mem->data,
                            NewStringType::kNormal,
                            mem->length)
@@ -173,25 +133,34 @@ MaybeLocal<Value> ToV8Value(Local<Context> context, const BIOPointer& bio) {
 }
 
 MaybeLocal<Value> ToBuffer(Environment* env, BIOPointer* bio) {
-  if (bio == nullptr || !*bio) return {};
+  if (bio == nullptr || !*bio) [[unlikely]]
+    return {};
   BUF_MEM* mem = *bio;
-  auto backing = ArrayBuffer::NewBackingStore(
+  if (!mem) [[unlikely]]
+    return {};
+  auto backing = AdoptIntoBackingStore(
+      env->isolate(),
       mem->data,
       mem->length,
       [](void*, size_t, void* data) {
         BIOPointer free_me(static_cast<BIO*>(data));
       },
       bio->release());
+  if (!backing) {
+    THROW_ERR_MEMORY_ALLOCATION_FAILED(env);
+    return MaybeLocal<Value>();
+  }
   auto ab = ArrayBuffer::New(env->isolate(), std::move(backing));
   Local<Value> ret;
   if (!Buffer::New(env, ab, 0, ab->ByteLength()).ToLocal(&ret)) return {};
   return ret;
 }
 
-MaybeLocal<Value> GetDer(Environment* env, const ncrypto::X509View& view) {
+MaybeLocal<Value> GetDer(Environment* env, const X509View& view) {
   Local<Value> ret;
   auto bio = view.toDER();
-  if (!bio) return Undefined(env->isolate());
+  if (!bio) [[unlikely]]
+    return Undefined(env->isolate());
   if (!ToBuffer(env, &bio).ToLocal(&ret)) {
     return {};
   }
@@ -199,87 +168,97 @@ MaybeLocal<Value> GetDer(Environment* env, const ncrypto::X509View& view) {
 }
 
 MaybeLocal<Value> GetSubjectAltNameString(Environment* env,
-                                          const ncrypto::X509View& view) {
+                                          const X509View& view) {
   Local<Value> ret;
   auto bio = view.getSubjectAltName();
-  if (!bio) return Undefined(env->isolate());
+  if (!bio) [[unlikely]]
+    return Undefined(env->isolate());
   if (!ToV8Value(env->context(), bio).ToLocal(&ret)) return {};
   return ret;
 }
 
-MaybeLocal<Value> GetInfoAccessString(Environment* env,
-                                      const ncrypto::X509View& view) {
+MaybeLocal<Value> GetInfoAccessString(Environment* env, const X509View& view) {
   Local<Value> ret;
   auto bio = view.getInfoAccess();
-  if (!bio) return Undefined(env->isolate());
+  if (!bio) [[unlikely]]
+    return Undefined(env->isolate());
   if (!ToV8Value(env->context(), bio).ToLocal(&ret)) {
     return {};
   }
   return ret;
 }
 
-MaybeLocal<Value> GetValidFrom(Environment* env,
-                               const ncrypto::X509View& view) {
+MaybeLocal<Value> GetValidFrom(Environment* env, const X509View& view) {
   Local<Value> ret;
   auto bio = view.getValidFrom();
-  if (!bio) return Undefined(env->isolate());
+  if (!bio) [[unlikely]]
+    return Undefined(env->isolate());
   if (!ToV8Value(env->context(), bio).ToLocal(&ret)) {
     return {};
   }
   return ret;
 }
 
-MaybeLocal<Value> GetValidTo(Environment* env, const ncrypto::X509View& view) {
+MaybeLocal<Value> GetValidTo(Environment* env, const X509View& view) {
   Local<Value> ret;
   auto bio = view.getValidTo();
-  if (!bio) return Undefined(env->isolate());
+  if (!bio) [[unlikely]]
+    return Undefined(env->isolate());
   if (!ToV8Value(env->context(), bio).ToLocal(&ret)) {
     return {};
   }
   return ret;
 }
 
-MaybeLocal<Value> GetValidFromDate(Environment* env,
-                                   const ncrypto::X509View& view) {
+MaybeLocal<Value> GetValidFromDate(Environment* env, const X509View& view) {
   int64_t validFromTime = view.getValidFromTime();
   return Date::New(env->context(), validFromTime * 1000.);
 }
 
-MaybeLocal<Value> GetValidToDate(Environment* env,
-                                 const ncrypto::X509View& view) {
+MaybeLocal<Value> GetValidToDate(Environment* env, const X509View& view) {
   int64_t validToTime = view.getValidToTime();
   return Date::New(env->context(), validToTime * 1000.);
 }
 
-MaybeLocal<Value> GetSerialNumber(Environment* env,
-                                  const ncrypto::X509View& view) {
+MaybeLocal<Value> GetSignatureAlgorithm(Environment* env,
+                                        const X509View& view) {
+  auto algo = view.getSignatureAlgorithm();
+  if (!algo.has_value()) [[unlikely]]
+    return Undefined(env->isolate());
+  Local<Value> ret;
+  if (!ToV8Value(env, algo.value()).ToLocal(&ret)) {
+    return {};
+  }
+  return ret;
+}
+
+MaybeLocal<Value> GetSignatureAlgorithmOID(Environment* env,
+                                           const X509View& view) {
+  auto oid = view.getSignatureAlgorithmOID();
+  if (!oid.has_value()) [[unlikely]]
+    return Undefined(env->isolate());
+  Local<Value> ret;
+  if (!ToV8Value(env, oid.value()).ToLocal(&ret)) {
+    return {};
+  }
+  return ret;
+}
+
+MaybeLocal<Value> GetSerialNumber(Environment* env, const X509View& view) {
   if (auto serial = view.getSerialNumber()) {
-    return OneByteString(env->isolate(),
-                         static_cast<unsigned char*>(serial.get()));
+    return ToV8Value(
+        env, ToUpper(std::string_view(static_cast<char*>(serial.get()))));
   }
   return Undefined(env->isolate());
 }
 
-MaybeLocal<Value> GetKeyUsage(Environment* env, const ncrypto::X509View& cert) {
-  ncrypto::StackOfASN1 eku(static_cast<STACK_OF(ASN1_OBJECT)*>(
-      X509_get_ext_d2i(cert.get(), NID_ext_key_usage, nullptr, nullptr)));
-  if (eku) {
-    const int count = sk_ASN1_OBJECT_num(eku.get());
-    MaybeStackBuffer<Local<Value>, 16> ext_key_usage(count);
-    char buf[256];
-
-    int j = 0;
-    for (int i = 0; i < count; i++) {
-      if (OBJ_obj2txt(
-              buf, sizeof(buf), sk_ASN1_OBJECT_value(eku.get(), i), 1) >= 0) {
-        ext_key_usage[j++] = OneByteString(env->isolate(), buf);
-      }
-    }
-
-    return Array::New(env->isolate(), ext_key_usage.out(), count);
-  }
-
-  return Undefined(env->isolate());
+MaybeLocal<Value> GetKeyUsage(Environment* env, const X509View& cert) {
+  LocalVector<Value> vec(env->isolate());
+  bool res = cert.enumUsages([&](std::string_view view) {
+    vec.push_back(OneByteString(env->isolate(), view));
+  });
+  if (!res) return Undefined(env->isolate());
+  return Array::New(env->isolate(), vec.data(), vec.size());
 }
 
 void Pem(const FunctionCallbackInfo<Value>& args) {
@@ -382,6 +361,26 @@ void ValidToDate(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
+void SignatureAlgorithm(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  X509Certificate* cert;
+  ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
+  Local<Value> ret;
+  if (GetSignatureAlgorithm(env, cert->view()).ToLocal(&ret)) {
+    args.GetReturnValue().Set(ret);
+  }
+}
+
+void SignatureAlgorithmOID(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  X509Certificate* cert;
+  ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
+  Local<Value> ret;
+  if (GetSignatureAlgorithmOID(env, cert->view()).ToLocal(&ret)) {
+    args.GetReturnValue().Set(ret);
+  }
+}
+
 void SerialNumber(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   X509Certificate* cert;
@@ -400,7 +399,7 @@ void PublicKey(const FunctionCallbackInfo<Value>& args) {
   // TODO(tniessen): consider checking X509_get_pubkey() when the
   // X509Certificate object is being created.
   auto result = cert->view().getPublicKey();
-  if (!result.value) {
+  if (!result.value) [[unlikely]] {
     ThrowCryptoError(env, result.error.value_or(0));
     return;
   }
@@ -465,81 +464,64 @@ void CheckPublicKey(const FunctionCallbackInfo<Value>& args) {
       cert->view().checkPublicKey(key->Data().GetAsymmetricKey()));
 }
 
-void CheckHost(const FunctionCallbackInfo<Value>& args) {
+template <typename F>
+void CheckX509Subject(const FunctionCallbackInfo<Value>& args, F check) {
   Environment* env = Environment::GetCurrent(args);
   X509Certificate* cert;
   ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
 
-  CHECK(args[0]->IsString());  // name
+  CHECK(args[0]->IsString());  // subject
   CHECK(args[1]->IsUint32());  // flags
 
-  Utf8Value name(env->isolate(), args[0]);
+  Utf8Value subject(env->isolate(), args[0]);
   uint32_t flags = args[1].As<Uint32>()->Value();
-  ncrypto::DataPointer peername;
 
-  switch (cert->view().checkHost(name.ToStringView(), flags, &peername)) {
-    case ncrypto::X509View::CheckMatch::MATCH: {  // Match!
+  DataPointer matched_subject;
+  X509View view = cert->view();
+  auto result = check(view, subject.ToStringView(), flags, &matched_subject);
+  switch (result) {
+    case X509View::CheckMatch::MATCH: {
       Local<Value> ret = args[0];
-      if (peername) {
+      if (matched_subject) {
         ret = OneByteString(env->isolate(),
-                            static_cast<const char*>(peername.get()),
-                            peername.size());
+                            matched_subject.get<const char>(),
+                            matched_subject.size());
       }
       return args.GetReturnValue().Set(ret);
     }
-    case ncrypto::X509View::CheckMatch::NO_MATCH:  // No Match!
-      return;  // No return value is set
-    case ncrypto::X509View::CheckMatch::INVALID_NAME:  // Error!
+    case X509View::CheckMatch::NO_MATCH:
+      break;  // No return value is set.
+    case X509View::CheckMatch::INVALID_NAME:
       return THROW_ERR_INVALID_ARG_VALUE(env, "Invalid name");
-    default:  // Error!
+    default:
       return THROW_ERR_CRYPTO_OPERATION_FAILED(env);
   }
+}
+
+void CheckHost(const FunctionCallbackInfo<Value>& args) {
+  CheckX509Subject(
+      args,
+      [](X509View& cert,
+         std::string_view subject,
+         uint32_t flags,
+         DataPointer* match) { return cert.checkHost(subject, flags, match); });
 }
 
 void CheckEmail(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  X509Certificate* cert;
-  ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
-
-  CHECK(args[0]->IsString());  // name
-  CHECK(args[1]->IsUint32());  // flags
-
-  Utf8Value name(env->isolate(), args[0]);
-  uint32_t flags = args[1].As<Uint32>()->Value();
-
-  switch (cert->view().checkEmail(name.ToStringView(), flags)) {
-    case ncrypto::X509View::CheckMatch::MATCH:  // Match!
-      return args.GetReturnValue().Set(args[0]);
-    case ncrypto::X509View::CheckMatch::NO_MATCH:  // No Match!
-      return;  // No return value is set
-    case ncrypto::X509View::CheckMatch::INVALID_NAME:  // Error!
-      return THROW_ERR_INVALID_ARG_VALUE(env, "Invalid name");
-    default:  // Error!
-      return THROW_ERR_CRYPTO_OPERATION_FAILED(env);
-  }
+  CheckX509Subject(
+      args,
+      [](X509View& cert,
+         std::string_view subject,
+         uint32_t flags,
+         DataPointer*) { return cert.checkEmail(subject, flags); });
 }
 
 void CheckIP(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  X509Certificate* cert;
-  ASSIGN_OR_RETURN_UNWRAP(&cert, args.This());
-
-  CHECK(args[0]->IsString());  // IP
-  CHECK(args[1]->IsUint32());  // flags
-
-  Utf8Value name(env->isolate(), args[0]);
-  uint32_t flags = args[1].As<Uint32>()->Value();
-
-  switch (cert->view().checkIp(name.ToStringView(), flags)) {
-    case ncrypto::X509View::CheckMatch::MATCH:  // Match!
-      return args.GetReturnValue().Set(args[0]);
-    case ncrypto::X509View::CheckMatch::NO_MATCH:  // No Match!
-      return;  // No return value is set
-    case ncrypto::X509View::CheckMatch::INVALID_NAME:  // Error!
-      return THROW_ERR_INVALID_ARG_VALUE(env, "Invalid IP");
-    default:  // Error!
-      return THROW_ERR_CRYPTO_OPERATION_FAILED(env);
-  }
+  CheckX509Subject(args,
+                   [](X509View& cert,
+                      std::string_view subject,
+                      uint32_t flags,
+                      DataPointer*) { return cert.checkIp(subject, flags); });
 }
 
 void GetIssuerCert(const FunctionCallbackInfo<Value>& args) {
@@ -560,7 +542,9 @@ void Parse(const FunctionCallbackInfo<Value>& args) {
       .len = buf.length(),
   });
 
-  if (!result.value) return ThrowCryptoError(env, result.error.value_or(0));
+  if (!result.value) [[unlikely]] {
+    return ThrowCryptoError(env, result.error.value_or(0));
+  }
 
   if (X509Certificate::New(env, std::move(result.value)).ToLocal(&cert)) {
     args.GetReturnValue().Set(cert);
@@ -584,7 +568,8 @@ bool Set(Environment* env,
          Local<Value> name,
          MaybeLocal<T> maybe_value) {
   Local<Value> value;
-  if (!maybe_value.ToLocal(&value)) return false;
+  if (!maybe_value.ToLocal(&value)) [[unlikely]]
+    return false;
 
   // Undefined is ignored, but still considered successful
   if (value->IsUndefined()) return true;
@@ -598,7 +583,8 @@ bool Set(Environment* env,
          uint32_t index,
          MaybeLocal<T> maybe_value) {
   Local<Value> value;
-  if (!maybe_value.ToLocal(&value)) return false;
+  if (!maybe_value.ToLocal(&value)) [[unlikely]]
+    return false;
 
   // Undefined is ignored, but still considered successful
   if (value->IsUndefined()) return true;
@@ -609,14 +595,9 @@ bool Set(Environment* env,
 // Convert an X509_NAME* into a JavaScript object.
 // Each entry of the name is converted into a property of the object.
 // The property value may be a single string or an array of strings.
-template <X509_NAME* get_name(const X509*)>
 static MaybeLocal<Value> GetX509NameObject(Environment* env,
-                                           const ncrypto::X509View& cert) {
-  X509_NAME* name = get_name(cert.get());
-  CHECK_NOT_NULL(name);
-
-  int cnt = X509_NAME_entry_count(name);
-  CHECK_GE(cnt, 0);
+                                           const X509Name& name) {
+  if (!name) return {};
 
   Local<Value> v8_name;
   Local<Value> v8_value;
@@ -625,14 +606,9 @@ static MaybeLocal<Value> GetX509NameObject(Environment* env,
       Object::New(env->isolate(), Null(env->isolate()), nullptr, nullptr, 0);
   if (result.IsEmpty()) return {};
 
-  for (int i = 0; i < cnt; i++) {
-    X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
-    CHECK_NOT_NULL(entry);
-
-    if (!ToV8Value(env->context(), X509_NAME_ENTRY_get_object(entry))
-             .ToLocal(&v8_name) ||
-        !ToV8Value(env->context(), X509_NAME_ENTRY_get_data(entry))
-             .ToLocal(&v8_value)) {
+  for (auto i : name) {
+    if (!ToV8Value(env, i.first).ToLocal(&v8_name) ||
+        !ToV8Value(env, i.second).ToLocal(&v8_value)) {
       return {};
     }
 
@@ -677,50 +653,43 @@ static MaybeLocal<Value> GetX509NameObject(Environment* env,
   return result;
 }
 
-MaybeLocal<Object> GetPubKey(Environment* env, OSSL3_CONST RSA* rsa) {
-  int size = i2d_RSA_PUBKEY(rsa, nullptr);
-  CHECK_GE(size, 0);
-
-  std::unique_ptr<BackingStore> bs;
-  {
-    NoArrayBufferZeroFillScope no_zero_fill_scope(env->isolate_data());
-    bs = ArrayBuffer::NewBackingStore(env->isolate(), size);
-  }
-
-  unsigned char* serialized = reinterpret_cast<unsigned char*>(bs->Data());
-  CHECK_GE(i2d_RSA_PUBKEY(rsa, &serialized), 0);
-
-  Local<ArrayBuffer> ab = ArrayBuffer::New(env->isolate(), std::move(bs));
-  return Buffer::New(env, ab, 0, ab->ByteLength()).FromMaybe(Local<Object>());
+MaybeLocal<Object> GetPubKey(Environment* env, const ncrypto::Rsa& rsa) {
+  auto bio = rsa.derPublicKey();
+  Local<Value> ret;
+  if (!ToBuffer(env, &bio).ToLocal(&ret)) return {};
+  return ret.As<Object>();
 }
 
 MaybeLocal<Value> GetModulusString(Environment* env, const BIGNUM* n) {
-  auto bio = BIOPointer::NewMem();
-  if (!bio) return {};
-  BN_print(bio.get(), n);
+  auto bio = BIOPointer::New(n);
+  if (!bio) [[unlikely]]
+    return {};
   return ToV8Value(env->context(), bio);
 }
 
 MaybeLocal<Value> GetExponentString(Environment* env, const BIGNUM* e) {
-  uint64_t exponent_word = static_cast<uint64_t>(BignumPointer::GetWord(e));
+  if (e == nullptr) return Null(env->isolate());
   auto bio = BIOPointer::NewMem();
-  if (!bio) return {};
-  BIO_printf(bio.get(), "0x%" PRIx64, exponent_word);
+  if (!bio) [[unlikely]]
+    return {};
+  BIO_puts(bio.get(), "0x");
+  BN_print(bio.get(), e);
   return ToV8Value(env->context(), bio);
 }
 
-MaybeLocal<Value> GetECPubKey(Environment* env,
-                              const EC_GROUP* group,
-                              OSSL3_CONST EC_KEY* ec) {
-  const EC_POINT* pubkey = EC_KEY_get0_public_key(ec);
-  if (pubkey == nullptr) return Undefined(env->isolate());
+MaybeLocal<Value> GetECPubKey(Environment* env, const ncrypto::Ec& ec) {
+  const auto group = ec.getGroup();
+  const auto pubkey = ec.getPublicKey();
+  if (pubkey == nullptr) [[unlikely]]
+    return Undefined(env->isolate());
 
-  return ECPointToBuffer(env, group, pubkey, EC_KEY_get_conv_form(ec), nullptr)
+  return ECPointToBuffer(env, group, pubkey, ec.getPointConversionForm())
       .FromMaybe(Local<Object>());
 }
 
 MaybeLocal<Value> GetECGroupBits(Environment* env, const EC_GROUP* group) {
-  if (group == nullptr) return Undefined(env->isolate());
+  if (group == nullptr) [[unlikely]]
+    return Undefined(env->isolate());
 
   int bits = EC_GROUP_order_bits(group);
   if (bits <= 0) return Undefined(env->isolate());
@@ -730,124 +699,93 @@ MaybeLocal<Value> GetECGroupBits(Environment* env, const EC_GROUP* group) {
 
 template <const char* (*nid2string)(int nid)>
 MaybeLocal<Value> GetCurveName(Environment* env, const int nid) {
-  const char* name = nid2string(nid);
-  return name != nullptr
-             ? MaybeLocal<Value>(OneByteString(env->isolate(), name))
-             : MaybeLocal<Value>(Undefined(env->isolate()));
+  std::string_view name = nid2string(nid);
+  return name.size() ? MaybeLocal<Value>(OneByteString(env->isolate(), name))
+                     : MaybeLocal<Value>(Undefined(env->isolate()));
 }
 
-MaybeLocal<Object> X509ToObject(Environment* env,
-                                const ncrypto::X509View& cert) {
+MaybeLocal<Object> X509ToObject(Environment* env, const X509View& cert) {
   EscapableHandleScope scope(env->isolate());
-  Local<Object> info = Object::New(env->isolate());
 
-  if (!Set<Value>(env,
-                  info,
-                  env->subject_string(),
-                  GetX509NameObject<X509_get_subject_name>(env, cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->issuer_string(),
-                  GetX509NameObject<X509_get_issuer_name>(env, cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->subjectaltname_string(),
-                  GetSubjectAltNameString(env, cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->infoaccess_string(),
-                  GetInfoAccessString(env, cert)) ||
-      !Set<Boolean>(env,
-                    info,
-                    env->ca_string(),
-                    Boolean::New(env->isolate(), cert.isCA()))) {
-    return {};
+  auto tmpl = env->x509_dictionary_template();
+  if (tmpl.IsEmpty()) {
+    static constexpr std::string_view names[] = {
+        "subject",
+        "issuer",
+        "subjectaltname",
+        "infoAccess",
+        "ca",
+        "modulus",
+        "exponent",
+        "pubkey",
+        "bits",
+        "valid_from",
+        "valid_to",
+        "fingerprint",
+        "fingerprint256",
+        "fingerprint512",
+        "ext_key_usage",
+        "serialNumber",
+        "raw",
+        "asn1Curve",
+        "nistCurve",
+    };
+    tmpl = DictionaryTemplate::New(env->isolate(), names);
+    env->set_x509_dictionary_template(tmpl);
   }
 
-  OSSL3_CONST EVP_PKEY* pkey = X509_get0_pubkey(cert.get());
-  OSSL3_CONST RSA* rsa = nullptr;
-  OSSL3_CONST EC_KEY* ec = nullptr;
-  if (pkey != nullptr) {
-    switch (EVP_PKEY_id(pkey)) {
-      case EVP_PKEY_RSA:
-        rsa = EVP_PKEY_get0_RSA(pkey);
-        break;
-      case EVP_PKEY_EC:
-        ec = EVP_PKEY_get0_EC_KEY(pkey);
-        break;
-    }
-  }
+  MaybeLocal<Value> values[] = {
+      GetX509NameObject(env, cert.getSubjectName()),
+      GetX509NameObject(env, cert.getIssuerName()),
+      GetSubjectAltNameString(env, cert),
+      GetInfoAccessString(env, cert),
+      Boolean::New(env->isolate(), cert.isCA()),
+      Undefined(env->isolate()),  // modulus
+      Undefined(env->isolate()),  // exponent
+      Undefined(env->isolate()),  // pubkey
+      Undefined(env->isolate()),  // bits
+      GetValidFrom(env, cert),
+      GetValidTo(env, cert),
+      GetFingerprintDigest(env, Digest::SHA1, cert),
+      GetFingerprintDigest(env, Digest::SHA256, cert),
+      GetFingerprintDigest(env, Digest::SHA512, cert),
+      GetKeyUsage(env, cert),
+      GetSerialNumber(env, cert),
+      GetDer(env, cert),
+      Undefined(env->isolate()),  // asn1curve
+      Undefined(env->isolate()),  // nistcurve
+  };
 
-  if (rsa) {
-    const BIGNUM* n;
-    const BIGNUM* e;
-    RSA_get0_key(rsa, &n, &e, nullptr);
-    if (!Set<Value>(
-            env, info, env->modulus_string(), GetModulusString(env, n)) ||
-        !Set<Value>(
-            env,
-            info,
-            env->bits_string(),
-            Integer::New(env->isolate(), BignumPointer::GetBitCount(n))) ||
-        !Set<Value>(
-            env, info, env->exponent_string(), GetExponentString(env, e)) ||
-        !Set<Object>(env, info, env->pubkey_string(), GetPubKey(env, rsa))) {
-      return {};
-    }
-  } else if (ec) {
-    const EC_GROUP* group = EC_KEY_get0_group(ec);
+  cert.ifRsa([&](const ncrypto::Rsa& rsa) {
+    auto pub_key = rsa.getPublicKey();
+    values[5] = GetModulusString(env, pub_key.n);   // modulus
+    values[6] = GetExponentString(env, pub_key.e);  // exponent
+    values[7] = GetPubKey(env, rsa);                // pubkey
+    values[8] = Integer::New(env->isolate(),
+                             BignumPointer::GetBitCount(pub_key.n));  // bits
+    // TODO(@jasnell): The true response is a left-over from the original
+    // non DictionaryTemplate-based implementation. It can be removed later.
+    return true;
+  });
 
-    if (!Set<Value>(
-            env, info, env->bits_string(), GetECGroupBits(env, group)) ||
-        !Set<Value>(
-            env, info, env->pubkey_string(), GetECPubKey(env, group, ec))) {
-      return {};
-    }
-
-    const int nid = EC_GROUP_get_curve_name(group);
+  cert.ifEc([&](const ncrypto::Ec& ec) {
+    const auto group = ec.getGroup();
+    values[7] = GetECPubKey(env, ec);         // pubkey
+    values[8] = GetECGroupBits(env, group);   // bits
+    const int nid = ec.getCurve();
     if (nid != 0) {
-      // Curve is well-known, get its OID and NIST nick-name (if it has one).
-
-      if (!Set<Value>(env,
-                      info,
-                      env->asn1curve_string(),
-                      GetCurveName<OBJ_nid2sn>(env, nid)) ||
-          !Set<Value>(env,
-                      info,
-                      env->nistcurve_string(),
-                      GetCurveName<EC_curve_nid2nist>(env, nid))) {
-        return {};
-      }
-    } else {
-      // Unnamed curves can be described by their mathematical properties,
-      // but aren't used much (at all?) with X.509/TLS. Support later if needed.
+      // Curve is well-known, get its OID and NIST nick-name (if it has
+      // one).
+      values[17] = GetCurveName<OBJ_nid2sn>(env, nid);         // asn1curve
+      values[18] = GetCurveName<EC_curve_nid2nist>(env, nid);  // nistcurve
     }
-  }
+    // Unnamed curves can be described by their mathematical properties,
+    // but aren't used much (at all?) with X.509/TLS. Support later if
+    // needed.
+    return true;
+  });
 
-  if (!Set<Value>(
-          env, info, env->valid_from_string(), GetValidFrom(env, cert)) ||
-      !Set<Value>(env, info, env->valid_to_string(), GetValidTo(env, cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->fingerprint_string(),
-                  GetFingerprintDigest(env, EVP_sha1(), cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->fingerprint256_string(),
-                  GetFingerprintDigest(env, EVP_sha256(), cert)) ||
-      !Set<Value>(env,
-                  info,
-                  env->fingerprint512_string(),
-                  GetFingerprintDigest(env, EVP_sha512(), cert)) ||
-      !Set<Value>(
-          env, info, env->ext_key_usage_string(), GetKeyUsage(env, cert)) ||
-      !Set<Value>(
-          env, info, env->serial_number_string(), GetSerialNumber(env, cert)) ||
-      !Set<Value>(env, info, env->raw_string(), GetDer(env, cert))) {
-    return {};
-  }
-
-  return scope.Escape(info);
+  return scope.EscapeMaybe(NewDictionaryInstance(env->context(), tmpl, values));
 }
 }  // namespace
 
@@ -856,9 +794,9 @@ Local<FunctionTemplate> X509Certificate::GetConstructorTemplate(
   Local<FunctionTemplate> tmpl = env->x509_constructor_template();
   if (tmpl.IsEmpty()) {
     Isolate* isolate = env->isolate();
-    tmpl = NewFunctionTemplate(isolate, nullptr);
+    tmpl = NewFunctionTemplate(isolate, NewFromHandle);
     tmpl->InstanceTemplate()->SetInternalFieldCount(
-        BaseObject::kInternalFieldCount);
+        X509Certificate::kInternalFieldCount);
     tmpl->SetClassName(
         FIXED_ONE_BYTE_STRING(env->isolate(), "X509Certificate"));
     SetProtoMethodNoSideEffect(isolate, tmpl, "subject", Subject);
@@ -870,11 +808,15 @@ Local<FunctionTemplate> X509Certificate::GetConstructorTemplate(
     SetProtoMethodNoSideEffect(isolate, tmpl, "validToDate", ValidToDate);
     SetProtoMethodNoSideEffect(isolate, tmpl, "validFromDate", ValidFromDate);
     SetProtoMethodNoSideEffect(
-        isolate, tmpl, "fingerprint", Fingerprint<EVP_sha1>);
+        isolate, tmpl, "signatureAlgorithm", SignatureAlgorithm);
     SetProtoMethodNoSideEffect(
-        isolate, tmpl, "fingerprint256", Fingerprint<EVP_sha256>);
+        isolate, tmpl, "signatureAlgorithmOid", SignatureAlgorithmOID);
     SetProtoMethodNoSideEffect(
-        isolate, tmpl, "fingerprint512", Fingerprint<EVP_sha512>);
+        isolate, tmpl, "fingerprint", Fingerprint<Digest::SHA1>);
+    SetProtoMethodNoSideEffect(
+        isolate, tmpl, "fingerprint256", Fingerprint<Digest::SHA256>);
+    SetProtoMethodNoSideEffect(
+        isolate, tmpl, "fingerprint512", Fingerprint<Digest::SHA512>);
     SetProtoMethodNoSideEffect(isolate, tmpl, "keyUsage", KeyUsage);
     SetProtoMethodNoSideEffect(isolate, tmpl, "serialNumber", SerialNumber);
     SetProtoMethodNoSideEffect(isolate, tmpl, "pem", Pem);
@@ -895,37 +837,126 @@ Local<FunctionTemplate> X509Certificate::GetConstructorTemplate(
   return tmpl;
 }
 
-bool X509Certificate::HasInstance(Environment* env, Local<Object> object) {
-  return GetConstructorTemplate(env)->HasInstance(object);
+bool X509Certificate::HasInstance(Environment* env, Local<Value> value) {
+  return GetConstructorTemplate(env)->HasInstance(value);
+}
+
+void X509Certificate::NewFromHandle(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  if (args.Length() == 1 && args[0]->IsArrayBufferView()) {
+    ArrayBufferViewContents<unsigned char> buf(args[0].As<ArrayBufferView>());
+    auto result = X509Pointer::Parse(ncrypto::Buffer<const unsigned char>{
+        .data = buf.data(),
+        .len = buf.length(),
+    });
+    if (!result.value) [[unlikely]] {
+      return ThrowCryptoError(env, result.error.value_or(0));
+    }
+    new X509Certificate(env,
+                        args.This(),
+                        std::make_shared<ManagedX509>(std::move(result.value)));
+    return;
+  }
+
+  if (args.Length() != 1 || !HasInstance(env, args[0])) {
+    THROW_ERR_INVALID_ARG_TYPE(
+        env, "value must be an X509CertificateHandle or BufferSource");
+    return;
+  }
+
+  X509Certificate* handle = Unwrap<X509Certificate>(args[0].As<Object>());
+  CHECK_NOT_NULL(handle);
+  Local<Object> issuer;
+  if (handle->issuer_cert_) issuer = handle->issuer_cert_->object();
+  new X509Certificate(env, args.This(), handle->cert_, issuer);
+}
+
+void X509Certificate::CreateX509CertificateClass(
+    const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  CHECK_EQ(args.Length(), 1);
+  CHECK(args[0]->IsFunction());
+
+  Local<Value> ctor;
+  if (!GetConstructorTemplate(env)->GetFunction(env->context()).ToLocal(&ctor))
+    return;
+
+  Local<Value> ret;
+  if (!args[0]
+           .As<Function>()
+           ->Call(env->context(), Undefined(env->isolate()), 1, &ctor)
+           .ToLocal(&ret)) {
+    return;
+  }
+
+  Local<Array> constructors = ret.As<Array>();
+  Local<Value> internal_ctor;
+  if (!constructors->Get(env->context(), 1).ToLocal(&internal_ctor)) return;
+  CHECK(env->crypto_internal_x509_certificate_constructor().IsEmpty());
+  env->set_crypto_internal_x509_certificate_constructor(
+      internal_ctor.As<Function>());
+  args.GetReturnValue().Set(constructors);
+}
+
+void X509Certificate::IsX509Certificate(
+    const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  CHECK_EQ(args.Length(), 1);
+  args.GetReturnValue().Set(HasInstance(env, args[0]));
 }
 
 MaybeLocal<Object> X509Certificate::New(Environment* env,
                                         X509Pointer cert,
-                                        STACK_OF(X509) * issuer_chain) {
+                                        const STACK_OF(X509) * issuer_chain) {
   std::shared_ptr<ManagedX509> mcert(new ManagedX509(std::move(cert)));
   return New(env, std::move(mcert), issuer_chain);
 }
 
 MaybeLocal<Object> X509Certificate::New(Environment* env,
                                         std::shared_ptr<ManagedX509> cert,
-                                        STACK_OF(X509) * issuer_chain) {
+                                        const STACK_OF(X509) * issuer_chain) {
+  return NewWithIssuers(env, std::move(cert), issuer_chain, 0);
+}
+
+MaybeLocal<Object> X509Certificate::NewWithIssuers(
+    Environment* env,
+    std::shared_ptr<ManagedX509> cert,
+    const STACK_OF(X509) * issuer_chain,
+    int start) {
   EscapableHandleScope scope(env->isolate());
-  Local<Function> ctor;
-  if (!GetConstructorTemplate(env)->GetFunction(env->context()).ToLocal(&ctor))
-    return MaybeLocal<Object>();
-
   Local<Object> obj;
-  if (!ctor->NewInstance(env->context()).ToLocal(&obj))
+  if (!GetConstructorTemplate(env)
+           ->InstanceTemplate()
+           ->NewInstance(env->context())
+           .ToLocal(&obj)) {
     return MaybeLocal<Object>();
+  }
 
-  new X509Certificate(env, obj, std::move(cert), issuer_chain);
+  Local<Object> issuer;
+  if (issuer_chain != nullptr && start < sk_X509_num(issuer_chain)) {
+    X509Pointer issuer_cert =
+        X509View(sk_X509_value(issuer_chain, start)).clone();
+    if (!issuer_cert) [[unlikely]] {
+      return MaybeLocal<Object>();
+    }
+    if (!NewWithIssuers(env,
+                        std::make_shared<ManagedX509>(std::move(issuer_cert)),
+                        issuer_chain,
+                        start + 1)
+             .ToLocal(&issuer)) [[unlikely]] {
+      return MaybeLocal<Object>();
+    }
+  }
+
+  new X509Certificate(env, obj, std::move(cert), issuer);
   return scope.Escape(obj);
 }
 
 MaybeLocal<Object> X509Certificate::GetCert(Environment* env,
                                             const SSLPointer& ssl) {
-  auto cert = ncrypto::X509View::From(ssl);
-  if (!cert) return {};
+  auto cert = X509View::From(ssl);
+  if (!cert) [[unlikely]]
+    return {};
   return New(env, cert.clone());
 }
 
@@ -933,55 +964,52 @@ MaybeLocal<Object> X509Certificate::GetPeerCert(Environment* env,
                                                 const SSLPointer& ssl,
                                                 GetPeerCertificateFlag flag) {
   ClearErrorOnReturn clear_error_on_return;
-  MaybeLocal<Object> maybe_cert;
+
+  // The peer chain is owned by the SSL session and must not be modified. Its
+  // first entry is the peer certificate on the client but not on the server.
+  const STACK_OF(X509)* ssl_certs = SSL_get_peer_cert_chain(ssl.get());
+  int issuers_start = 0;
 
   X509Pointer cert;
   if ((flag & GetPeerCertificateFlag::SERVER) ==
       GetPeerCertificateFlag::SERVER) {
     cert = X509Pointer::PeerFrom(ssl);
   }
-
-  STACK_OF(X509)* ssl_certs = SSL_get_peer_cert_chain(ssl.get());
-  if (!cert && (ssl_certs == nullptr || sk_X509_num(ssl_certs) == 0))
-    return MaybeLocal<Object>();
-
   if (!cert) {
-    cert.reset(sk_X509_value(ssl_certs, 0));
-    sk_X509_delete(ssl_certs, 0);
+    if (ssl_certs == nullptr || sk_X509_num(ssl_certs) == 0)
+      return MaybeLocal<Object>();
+    cert = X509View(sk_X509_value(ssl_certs, 0)).clone();
+    if (!cert) [[unlikely]]
+      return MaybeLocal<Object>();
+    issuers_start = 1;
   }
 
-  return sk_X509_num(ssl_certs) ? New(env, std::move(cert), ssl_certs)
-                                : New(env, std::move(cert));
+  return NewWithIssuers(env,
+                        std::make_shared<ManagedX509>(std::move(cert)),
+                        ssl_certs,
+                        issuers_start);
 }
 
 v8::MaybeLocal<v8::Value> X509Certificate::toObject(Environment* env) {
   return toObject(env, view());
 }
 
-v8::MaybeLocal<v8::Value> X509Certificate::toObject(
-    Environment* env, const ncrypto::X509View& cert) {
-  if (!cert) return {};
+v8::MaybeLocal<v8::Value> X509Certificate::toObject(Environment* env,
+                                                    const X509View& cert) {
+  if (!cert) [[unlikely]]
+    return {};
   return X509ToObject(env, cert).FromMaybe(Local<Value>());
 }
 
-X509Certificate::X509Certificate(
-    Environment* env,
-    Local<Object> object,
-    std::shared_ptr<ManagedX509> cert,
-    STACK_OF(X509)* issuer_chain)
-    : BaseObject(env, object),
-      cert_(std::move(cert)) {
+X509Certificate::X509Certificate(Environment* env,
+                                 Local<Object> object,
+                                 std::shared_ptr<ManagedX509> cert,
+                                 Local<Object> issuer_chain)
+    : BaseObject(env, object), cert_(std::move(cert)) {
   MakeWeak();
 
-  if (issuer_chain != nullptr && sk_X509_num(issuer_chain)) {
-    X509Pointer cert(X509_dup(sk_X509_value(issuer_chain, 0)));
-    sk_X509_delete(issuer_chain, 0);
-    Local<Object> obj = sk_X509_num(issuer_chain)
-        ? X509Certificate::New(env, std::move(cert), issuer_chain)
-            .ToLocalChecked()
-        : X509Certificate::New(env, std::move(cert))
-            .ToLocalChecked();
-    issuer_cert_.reset(Unwrap<X509Certificate>(obj));
+  if (!issuer_chain.IsEmpty()) {
+    issuer_cert_.reset(Unwrap<X509Certificate>(issuer_chain));
   }
 }
 
@@ -994,7 +1022,7 @@ X509Certificate::X509CertificateTransferData::Deserialize(
     Environment* env,
     Local<Context> context,
     std::unique_ptr<worker::TransferData> self) {
-  if (context != env->context()) {
+  if (context != env->context()) [[unlikely]] {
     THROW_ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE(env);
     return {};
   }
@@ -1003,11 +1031,31 @@ X509Certificate::X509CertificateTransferData::Deserialize(
   if (!X509Certificate::New(env, data_).ToLocal(&handle))
     return {};
 
-  return BaseObjectPtr<BaseObject>(
-      Unwrap<X509Certificate>(handle.As<Object>()));
+  Local<Value> module =
+      FIXED_ONE_BYTE_STRING(env->isolate(), "internal/crypto/x509");
+  if (env->builtin_module_require()
+          ->Call(context, Null(env->isolate()), 1, &module)
+          .IsEmpty()) {
+    return {};
+  }
+
+  Local<Function> ctor = env->crypto_internal_x509_certificate_constructor();
+  CHECK(!ctor.IsEmpty());
+  Local<Value> cert;
+  if (!ctor->NewInstance(context, 1, &handle).ToLocal(&cert)) return {};
+
+  return BaseObjectPtr<BaseObject>(Unwrap<X509Certificate>(cert.As<Object>()));
 }
 
 BaseObject::TransferMode X509Certificate::GetTransferMode() const {
+  Local<Value> transfer_mode =
+      object()
+          ->GetPrivate(env()->context(), env()->transfer_mode_private_symbol())
+          .ToLocalChecked();
+  if (transfer_mode->IsUint32() &&
+      (transfer_mode.As<Uint32>()->Value() & TransferMode::kCloneable) == 0) {
+    return BaseObject::TransferMode::kDisallowCloneAndTransfer;
+  }
   return BaseObject::TransferMode::kCloneable;
 }
 
@@ -1017,6 +1065,12 @@ std::unique_ptr<worker::TransferData> X509Certificate::CloneForMessaging()
 }
 
 void X509Certificate::Initialize(Environment* env, Local<Object> target) {
+  SetMethod(env->context(),
+            target,
+            "createX509CertificateClass",
+            CreateX509CertificateClass);
+  SetMethodNoSideEffect(
+      env->context(), target, "isX509Certificate", IsX509Certificate);
   SetMethod(env->context(), target, "parseX509", Parse);
 
   NODE_DEFINE_CONSTANT(target, X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT);
@@ -1029,6 +1083,9 @@ void X509Certificate::Initialize(Environment* env, Local<Object> target) {
 
 void X509Certificate::RegisterExternalReferences(
     ExternalReferenceRegistry* registry) {
+  registry->Register(CreateX509CertificateClass);
+  registry->Register(IsX509Certificate);
+  registry->Register(NewFromHandle);
   registry->Register(Parse);
   registry->Register(Subject);
   registry->Register(SubjectAltName);
@@ -1038,9 +1095,11 @@ void X509Certificate::RegisterExternalReferences(
   registry->Register(ValidFrom);
   registry->Register(ValidToDate);
   registry->Register(ValidFromDate);
-  registry->Register(Fingerprint<EVP_sha1>);
-  registry->Register(Fingerprint<EVP_sha256>);
-  registry->Register(Fingerprint<EVP_sha512>);
+  registry->Register(SignatureAlgorithm);
+  registry->Register(SignatureAlgorithmOID);
+  registry->Register(Fingerprint<Digest::SHA1>);
+  registry->Register(Fingerprint<Digest::SHA256>);
+  registry->Register(Fingerprint<Digest::SHA512>);
   registry->Register(KeyUsage);
   registry->Register(SerialNumber);
   registry->Register(Pem);

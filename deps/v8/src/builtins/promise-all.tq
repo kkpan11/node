@@ -45,8 +45,9 @@ macro CreatePromiseAllResolveElementFunction(
   dcheck(index > 0);
   dcheck(index < kPropertyArrayHashFieldMax);
 
-  const resolve =
-      AllocateRootFunctionWithContext(resolveFunction, resolveElementContext);
+  const resolve = AllocateRootFunctionWithContext(
+      resolveFunction, resolveElementContext,
+      LoadNativeContext(resolveElementContext));
 
   dcheck(kPropertyArrayNoHashSentinel == 0);
   resolve.properties_or_hash = index;
@@ -62,17 +63,14 @@ macro CreatePromiseResolvingFunctionsContext(
           nativeContext,
           PromiseResolvingFunctionContextSlot::kPromiseContextLength));
   InitContextSlot(
-      resolveContext, PromiseResolvingFunctionContextSlot::kPromiseSlot,
-      promise);
-  InitContextSlot(
-      resolveContext, PromiseResolvingFunctionContextSlot::kAlreadyResolvedSlot,
-      False);
+      resolveContext,
+      PromiseResolvingFunctionContextSlot::kPromiseIfNotResolvedSlot, promise);
   InitContextSlot(
       resolveContext, PromiseResolvingFunctionContextSlot::kDebugEventSlot,
       debugEvent);
   static_assert(
       PromiseResolvingFunctionContextSlot::kPromiseContextLength ==
-      ContextSlot::MIN_CONTEXT_SLOTS + 3);
+      ContextSlot::MIN_CONTEXT_SLOTS + 2);
   return resolveContext;
 }
 
@@ -273,7 +271,7 @@ Reject(JSAny) {
       index += 1;
     }
   } catch (e, _message) deferred {
-    iterator::IteratorCloseOnException(iter);
+    iterator::IteratorCloseOnException(iter.object);
     goto Reject(e);
   } label Done {}
 
